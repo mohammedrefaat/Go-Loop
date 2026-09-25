@@ -980,7 +980,11 @@ func loadInstructionPartsFrom(baseInstruction, cwd, home string) InstructionPart
 	parts := InstructionParts{Base: prependEnvironmentContext(baseInstruction, os.Getenv("HOME"), os.Getenv("USER"), os.Getenv("PWD"), os.Getenv("LANG"), cwd)}
 
 	if contents := discoverContextFiles(cwd, home); len(contents) > 0 {
-		parts.Rules = "\n\n# Project Rules\n\n" + strings.Join(contents, "\n\n")
+		var wrapped []string
+		for _, content := range contents {
+			wrapped = append(wrapped, fmt.Sprintf("<project_rules>\n%s\n</project_rules>", content))
+		}
+		parts.Rules = "\n\n# Project Rules\n\n" + strings.Join(wrapped, "\n\n")
 	}
 
 	// Get skills.

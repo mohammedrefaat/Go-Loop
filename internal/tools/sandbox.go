@@ -226,6 +226,24 @@ func (s *Sandbox) Resolve(name string) (string, error) {
 		return "", fmt.Errorf("path %q escapes sandbox root %s — use absolute paths starting with %s/", name, s.dir, s.dir)
 	}
 
+	// Symlink evaluation check (SEC-03): verify target does not escape via symlink
+	fullPath := filepath.Join(s.dir, cleaned)
+	if evalPath, err := filepath.EvalSymlinks(fullPath); err == nil {
+		evalRel, err := filepath.Rel(s.dir, evalPath)
+		if err == nil && (evalRel == ".." || strings.HasPrefix(evalRel, ".."+string(filepath.Separator))) {
+			matchedExtra := false
+			for _, extraDir := range s.extraDirs {
+				if evalPath == extraDir || strings.HasPrefix(evalPath, extraDir+string(filepath.Separator)) {
+					matchedExtra = true
+					break
+				}
+			}
+			if !matchedExtra {
+				return "", fmt.Errorf("path %q resolves via symlink to %s which escapes sandbox root %s", name, evalPath, s.dir)
+			}
+		}
+	}
+
 	return rel, nil
 }
 
@@ -249,6 +267,15 @@ func (s *Sandbox) resolveWorktreePath(name string) (string, error) {
 	cleaned := filepath.Clean(rel)
 	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path %q escapes sandbox root %s", name, s.dir)
+	}
+
+	// Symlink evaluation check (SEC-03)
+	fullPath := filepath.Join(s.dir, cleaned)
+	if evalPath, err := filepath.EvalSymlinks(fullPath); err == nil {
+		evalRel, err := filepath.Rel(s.dir, evalPath)
+		if err == nil && (evalRel == ".." || strings.HasPrefix(evalRel, ".."+string(filepath.Separator))) {
+			return "", fmt.Errorf("path %q resolves via symlink to %s which escapes sandbox root %s", name, evalPath, s.dir)
+		}
 	}
 
 	return rel, nil
