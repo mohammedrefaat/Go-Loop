@@ -679,11 +679,8 @@ func initNonInteractiveRuntime(ctx context.Context, cfg *config.Config, cwd, san
 		return nil, fmt.Errorf("creating sandbox: %w", err)
 	}
 
-	if home, hErr := os.UserHomeDir(); hErr == nil {
-		if aErr := sandbox.AddExtraDir(filepath.Join(home, ".pi-go")); aErr != nil {
-			fmt.Fprintf(os.Stderr, "pi-go: warning: could not add ~/.pi-go to sandbox: %v\n", aErr)
-		}
-	}
+	// Security (SEC-06): Do not add ~/.pi-go to sandbox extraRoots by default
+	// to prevent tools from exposing global process credentials or API keys.
 
 	bashSup := tools.NewBashSupervisor()
 	coreTools, err := tools.CoreTools(sandbox, tools.WithBashSupervisor(bashSup))

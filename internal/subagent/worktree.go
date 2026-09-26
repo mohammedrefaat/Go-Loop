@@ -716,12 +716,27 @@ func (m *WorktreeManager) gitIn(dir string, args ...string) (string, error) {
 	return runGit(dir, args...)
 }
 
-// runGit shells out to git in dir and returns trimmed combined output.
+// runGit shells out to git in dir and returns trimmed combined output, retrying
+// on transient .git/index.lock contention.
 func runGit(dir string, args ...string) (string, error) {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	out, err := cmd.CombinedOutput()
-	return strings.TrimSpace(string(out)), err
+	const maxRetries = 3
+	var lastErr error
+	var lastOut string
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		lastOut = strings.TrimSpace(string(out))
+		lastErr = err
+		if err != nil && (strings.Contains(lastOut, "index.lock") || strings.Contains(lastOut, "File exists")) {
+			if attempt < maxRetries-1 {
+				time.Sleep(100 * time.Millisecond * time.Duration(attempt+1))
+				continue
+			}
+		}
+		return lastOut, lastErr
+	}
+	return lastOut, lastErr
 }
 
 // branchExists reports whether a local branch with the given name exists.
