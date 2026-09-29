@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -112,6 +114,52 @@ func TestHandleSlashCommandCopy(t *testing.T) {
 	}
 	if !strings.Contains(mm.chatModel.Messages[2].content, "Copied") {
 		t.Errorf("expected copy confirmation, got %q", mm.chatModel.Messages[2].content)
+	}
+}
+
+func TestHandleSlashCommandCopySubcommands(t *testing.T) {
+	m := &model{
+		inputModel: InputModel{Text: "/copy last"},
+		chatModel: ChatModel{Messages: []message{
+			{role: "user", content: "write a function"},
+			{role: "assistant", content: "Sure, here it is:\n```go\nfunc add(a, b int) int { return a + b }\n```\nEnjoy!"},
+		}},
+	}
+
+	// Test /copy last
+	newM, cmd := m.handleSlashCommand("/copy last")
+	if cmd == nil {
+		t.Fatal("expected clipboard command for /copy last")
+	}
+	expectedLast := "Sure, here it is:\n```go\nfunc add(a, b int) int { return a + b }\n```\nEnjoy!"
+	if got := fmt.Sprint(cmd()); got != expectedLast {
+		t.Errorf("got %q, want %q", got, expectedLast)
+	}
+
+	// Test /copy code
+	mm := newM.(*model)
+	newM, cmd = mm.handleSlashCommand("/copy code")
+	if cmd == nil {
+		t.Fatal("expected clipboard command for /copy code")
+	}
+	expectedCode := "func add(a, b int) int { return a + b }"
+	if got := fmt.Sprint(cmd()); got != expectedCode {
+		t.Errorf("got %q, want %q", got, expectedCode)
+	}
+
+	// Test /copy file
+	tmpFile := filepath.Join(t.TempDir(), "test_export.md")
+	mm = newM.(*model)
+	newM, cmd = mm.handleSlashCommand("/copy file " + tmpFile)
+	if cmd == nil {
+		t.Fatal("expected clipboard command for /copy file")
+	}
+	content, err := os.ReadFile(tmpFile)
+	if err != nil {
+		t.Fatalf("failed to read exported file: %v", err)
+	}
+	if string(content) != expectedLast {
+		t.Errorf("unexpected file content: %q, want %q", string(content), expectedLast)
 	}
 }
 

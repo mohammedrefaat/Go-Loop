@@ -154,6 +154,9 @@ func clipboardCommand() *exec.Cmd {
 	case "darwin":
 		return exec.Command("pbcopy")
 	case "windows":
+		if path, err := exec.LookPath("clip"); err == nil {
+			return exec.Command(path)
+		}
 		return exec.Command("clip")
 	default:
 		if _, err := exec.LookPath("wl-copy"); err == nil {

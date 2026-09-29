@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -97,7 +98,7 @@ func slashCmdVoid(f func(*model)) func(*model, []string) (tea.Model, tea.Cmd) {
 var slashCommandSpecs = []slashCommandSpec{
 	{name: "/help", desc: "Show help", run: slashCmdVoid((*model).showHelpMessage)},
 	{name: "/clear", desc: "Clear conversation", run: slashCmdVoid((*model).clearConversation)},
-	{name: "/copy", desc: "Copy conversation to clipboard", run: slashCmdBare((*model).handleCopyCommand)},
+	{name: "/copy", desc: "Copy conversation to clipboard", run: (*model).handleCopyCommand},
 	{name: "/model", desc: "Show or switch model", run: (*model).handleModelCommand},
 	{name: "/session", desc: "Show session info", run: slashCmdVoid((*model).showSessionMessage)},
 	{name: "/context", desc: "Show context usage", run: slashCmdVoid((*model).showContextMessage)},
@@ -170,9 +171,8 @@ func (m *model) handleQuitCommand() (tea.Model, tea.Cmd) {
 	return m, tea.Quit
 }
 
-func (m *model) handleCopyCommand() (tea.Model, tea.Cmd) {
-	transcript := m.chatModel.PlainTranscript()
-	if transcript == "" {
+func (m *model) handleCopyCommand(args []string) (tea.Model, tea.Cmd) {
+	if len(m.chatModel.Messages) == 0 {
 		m.chatModel.Messages = append(m.chatModel.Messages, message{
 			role:    "assistant",
 			content: "Nothing to copy yet.",
@@ -180,11 +180,108 @@ func (m *model) handleCopyCommand() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	mode := "all"
+	var filePath string
+
+	for i := 0; i < len(args); i++ {
+		arg := strings.ToLower(args[i])
+		switch arg {
+		case "last", "reply", "response":
+			mode = "last"
+		case "code", "snippet":
+			mode = "code"
+		case "all", "full", "transcript":
+			mode = "all"
+		case "file", "save", "out":
+			if i+1 < len(args) {
+				filePath = args[i+1]
+				i++
+			} else {
+				filePath = "pi-output.md"
+			}
+		default:
+			if strings.Contains(args[i], ".") || strings.Contains(args[i], "/") || strings.Contains(args[i], "\\") {
+				filePath = args[i]
+			}
+		}
+	}
+
+	hasExplicitAll := false
+	for _, a := range args {
+		if strings.ToLower(a) == "all" || strings.ToLower(a) == "transcript" {
+			hasExplicitAll = true
+			break
+		}
+	}
+	if filePath != "" && !hasExplicitAll && mode == "all" {
+		mode = "last"
+	}
+
+	var text string
+	var desc string
+
+	switch mode {
+	case "last":
+		last := m.chatModel.LastAssistantMessage()
+		if last == "" {
+			m.chatModel.Messages = append(m.chatModel.Messages, message{
+				role:    "assistant",
+				content: "No assistant reply to copy yet.",
+				isMeta:  true,
+			})
+			return m, nil
+		}
+		text = last
+		desc = fmt.Sprintf("last reply (%d chars)", len(text))
+
+	case "code":
+		last := m.chatModel.LastAssistantMessage()
+		if last == "" {
+			m.chatModel.Messages = append(m.chatModel.Messages, message{
+				role:    "assistant",
+				content: "No assistant reply to copy code from.",
+				isMeta:  true,
+			})
+			return m, nil
+		}
+		text = ExtractCodeBlocks(last)
+		desc = fmt.Sprintf("code block(s) (%d chars)", len(text))
+
+	default: // "all"
+		transcript := m.chatModel.PlainTranscript()
+		if transcript == "" {
+			m.chatModel.Messages = append(m.chatModel.Messages, message{
+				role:    "assistant",
+				content: "Nothing to copy yet.",
+				isMeta:  true,
+			})
+			return m, nil
+		}
+		text = transcript
+		desc = "conversation"
+	}
+
+	writeSystemClipboard(text)
+
+	var confirmMsg string
+	if filePath != "" {
+		if err := os.WriteFile(filePath, []byte(text), 0o600); err != nil {
+			confirmMsg = fmt.Sprintf("Copied %s to clipboard, but failed to save file: %v", desc, err)
+		} else {
+			confirmMsg = fmt.Sprintf("Copied %s to clipboard and saved to `%s`.", desc, filePath)
+		}
+	} else if mode == "all" && len(args) == 0 {
+		confirmMsg = "Copied conversation to clipboard. (Tip: use `/copy last` for only the last reply, `/copy code` for code blocks, or `/copy file <path>` to save to a file)"
+	} else {
+		confirmMsg = fmt.Sprintf("Copied %s to clipboard.", desc)
+	}
+
 	m.chatModel.Messages = append(m.chatModel.Messages, message{
 		role:    "assistant",
-		content: "Copied conversation to clipboard.",
+		content: confirmMsg,
+		isMeta:  true,
 	})
-	return m, tea.SetClipboard(transcript)
+	return m, tea.SetClipboard(text)
 }
 
 // handleBranchCommand handles /branch subcommands: create, switch, list.

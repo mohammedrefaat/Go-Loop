@@ -664,6 +664,9 @@ func (c *ChatModel) PlainTranscript() string {
 
 	var b strings.Builder
 	for _, msg := range c.Messages {
+		if msg.isMeta || strings.HasPrefix(msg.content, "Copied ") {
+			continue
+		}
 		content := strings.TrimSpace(msg.content)
 		if content == "" {
 			continue
@@ -698,6 +701,54 @@ func transcriptLabel(msg message) string {
 		}
 		return msg.role + ":"
 	}
+}
+
+// LastAssistantMessage returns the plain content of the most recent assistant reply,
+// skipping errors, warnings, metadata lines, and copy confirmation notices.
+func (c *ChatModel) LastAssistantMessage() string {
+	for i := len(c.Messages) - 1; i >= 0; i-- {
+		msg := c.Messages[i]
+		if msg.role == "assistant" && !msg.isError && !msg.isWarning && !msg.isMeta {
+			content := strings.TrimSpace(msg.content)
+			if content != "" && !strings.HasPrefix(content, "Copied ") {
+				return content
+			}
+		}
+	}
+	return ""
+}
+
+// ExtractCodeBlocks pulls out the text inside markdown code fences (```...```).
+// If multiple code blocks exist, they are joined with double newlines.
+// If no code blocks are found, it returns the input text verbatim.
+func ExtractCodeBlocks(text string) string {
+	var blocks []string
+	lines := strings.Split(text, "\n")
+	var current []string
+	inBlock := false
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			if inBlock {
+				blocks = append(blocks, strings.Join(current, "\n"))
+				current = nil
+				inBlock = false
+			} else {
+				inBlock = true
+				current = nil
+			}
+			continue
+		}
+		if inBlock {
+			current = append(current, line)
+		}
+	}
+
+	if len(blocks) > 0 {
+		return strings.Join(blocks, "\n\n")
+	}
+	return text
 }
 
 // RenderMessages renders all messages into a string for display.

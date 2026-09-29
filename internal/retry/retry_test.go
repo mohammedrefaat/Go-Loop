@@ -46,6 +46,9 @@ func TestIsTransient(t *testing.T) {
 		{"ref'd 500", errors.New("Internal Server Error (ref: ed5c545e-ddee-4abf-a1f4-90ab10fdbcc2)"), true},
 		{"overloaded model", errors.New("503 Service Unavailable: model 'minimax-m3' is temporarily overloaded, please retry shortly or try a different model"), true},
 		{"sse server_error", errors.New(`received error while streaming: {"type":"server_error","code":"server_error","message":"An error occurred while processing your request. You can retry your request"}`), true},
+		{"omnirouter 502 with upstream 403 forbidden", errors.New(`502 Bad Gateway: {"error":{"message":"oc/muse-spark-c529e7: all upstream requests failed. Last error: OpenCode free tier 403: Forbidden (body: {\"error\":{\"message\":\"You have been rate limited or forbidden\",\"code\":403}}). Candidates attempted: oc/muse-spark-c529e7: 403; oc/claude-3-5: 429","type":"bad_gateway"}}`), true},
+		{"openrouter 502 upstream unauthorized", errors.New(`502 Bad Gateway: all upstream requests failed: upstream provider returned 401 unauthorized`), true},
+		{"gateway timeout with forbidden details", errors.New(`504 Gateway Timeout: all upstream requests failed after candidate 403 Forbidden`), true},
 
 		// Retryable: connection and stream faults.
 		{"connection reset", errors.New("connection reset by peer"), true},
@@ -344,5 +347,23 @@ func TestServerDelayRejectsNonNumericHint(t *testing.T) {
 	}
 	if _, ok := ServerDelay(providerErr(huge + "s")); ok {
 		t.Error("an overflowing figure should not read as a delay")
+	}
+}
+
+func TestIsTransientGatewayBeatsUpstreamTerminal(t *testing.T) {
+	gatewayErrors := []string{
+		`502 Bad Gateway: {"error":{"message":"oc/muse-spark: all upstream requests failed. Last error: OpenCode free tier 403: Forbidden"}}`,
+		`504 Gateway Timeout: upstream candidate returned 401 unauthorized`,
+		`503 Service Unavailable: invalid_api_key on candidate route`,
+		`bad_gateway: all upstream requests failed`,
+	}
+	for _, raw := range gatewayErrors {
+		err := errors.New(raw)
+		if !IsTransient(err) {
+			t.Errorf("expected gateway error %q to be transient", raw)
+		}
+		if IsTerminal(err) {
+			t.Errorf("expected gateway error %q NOT to be terminal", raw)
+		}
 	}
 }

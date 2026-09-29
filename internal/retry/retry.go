@@ -93,6 +93,25 @@ var terminalPatterns = []string{
 	"operation not permitted",
 }
 
+// gatewayPatterns are failures from reverse proxies, load balancers, and AI gateways
+// (e.g. OmniRoute, OpenRouter, LiteLLM, Cloudflare AI Gateway) indicating transient
+// routing or upstream provider rotation failure.
+//
+// These are matched *before* terminalPatterns because gateway error bodies often
+// aggregate candidate attempt logs containing "403: Forbidden" or "unauthorized"
+// from internal routes that failed before the gateway returned 502/503/504 to pi-go.
+var gatewayPatterns = []string{
+	"502",
+	"503",
+	"504",
+	"bad gateway",
+	"bad_gateway",
+	"gateway timeout",
+	"service unavailable",
+	"all upstream requests failed",
+	"the combo failed transiently",
+}
+
 // transientPatterns are failures that a later identical request may survive.
 var transientPatterns = []string{
 	// Rate limiting proper — reached only if no terminal pattern matched.
@@ -158,7 +177,11 @@ func IsTerminal(err error) bool {
 	if _, ok := ServerDelay(err); ok {
 		return false
 	}
-	return containsAny(strings.ToLower(err.Error()), terminalPatterns)
+	msg := strings.ToLower(err.Error())
+	if containsAny(msg, gatewayPatterns) {
+		return false
+	}
+	return containsAny(msg, terminalPatterns)
 }
 
 // IsTransient reports whether err is worth retrying.
@@ -177,6 +200,13 @@ func IsTransient(err error) bool {
 	// your plan and billing") while still telling us exactly when its window
 	// reopens.
 	if _, ok := ServerDelay(err); ok {
+		return true
+	}
+
+	// Gateway/proxy faults win over terminal patterns: reverse proxies
+	// like OmniRoute return 502/503/504 while logging candidate route attempts
+	// that often mention "forbidden" or "unauthorized" from failed models.
+	if containsAny(msg, gatewayPatterns) {
 		return true
 	}
 
