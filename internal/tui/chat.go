@@ -270,11 +270,13 @@ type traceEntry struct {
 
 // ChatModel manages the conversation message display, scrolling, and markdown rendering.
 type ChatModel struct {
-	Messages  []message
-	Scroll    int // scroll offset from bottom
-	Streaming string
-	Thinking  string
-	Renderer  *glamour.TermRenderer
+	Messages          []message // active / in-progress turn messages
+	CommittedMessages []message // past finished turns emitted to terminal scrollback
+	HasCommitted      bool      // whether any completed turn has been committed to scrollback
+	Scroll            int       // scroll offset from bottom
+	Streaming         string
+	Thinking          string
+	Renderer          *glamour.TermRenderer
 
 	// rendererPaletteKey fingerprints the palette Renderer was built with, so
 	// RefreshTheme can tell a real theme change from a redundant call.
@@ -285,19 +287,26 @@ type ChatModel struct {
 	// Palette is the resolved theme palette, set each frame by the model before
 	// rendering. Zero means the dark default.
 	Palette Palette
+
+	// markdownCache caches Glamour-rendered markdown by content string,
+	// invalidated on terminal resize or theme change.
+	markdownCache map[string]string
 }
 
 // NewChatModel creates a ChatModel with the given markdown renderer.
 func NewChatModel(renderer *glamour.TermRenderer) ChatModel {
 	return ChatModel{
-		Messages: make([]message, 0),
-		Renderer: renderer,
+		Messages:      make([]message, 0),
+		Renderer:      renderer,
+		markdownCache: make(map[string]string),
 	}
 }
 
 // Clear removes all messages and resets scroll.
 func (c *ChatModel) Clear() {
 	c.Messages = c.Messages[:0]
+	c.CommittedMessages = c.CommittedMessages[:0]
+	c.HasCommitted = false
 	c.Scroll = 0
 }
 
@@ -481,6 +490,12 @@ func (c *ChatModel) invalidateRenderCaches() {
 		c.Messages[i].renderCacheKey = 0
 		c.Messages[i].renderCached = false
 	}
+	for i := range c.CommittedMessages {
+		c.CommittedMessages[i].renderCache = ""
+		c.CommittedMessages[i].renderCacheKey = 0
+		c.CommittedMessages[i].renderCached = false
+	}
+	clear(c.markdownCache)
 }
 
 // markdownLinkRe matches markdown links with both text and URL.
@@ -589,13 +604,23 @@ func (c *ChatModel) RenderMarkdown(text string) string {
 	if text == "" {
 		return ""
 	}
+	if c.markdownCache == nil {
+		c.markdownCache = make(map[string]string)
+	}
+	if cached, ok := c.markdownCache[text]; ok {
+		return cached
+	}
 	if c.Renderer == nil {
-		return expandLinks(text)
+		rendered := expandLinks(text)
+		c.markdownCache[text] = rendered
+		return rendered
 	}
 
 	segments := splitMermaidFences(text)
 	if len(segments) == 1 && segments[0].diagram == "" {
-		return c.renderMarkdownSegment(text)
+		rendered := c.renderMarkdownSegment(text)
+		c.markdownCache[text] = rendered
+		return rendered
 	}
 
 	parts := make([]string, 0, len(segments))
@@ -628,7 +653,9 @@ func (c *ChatModel) RenderMarkdown(text string) string {
 		}
 	}
 
-	return strings.Join(parts, "\n")
+	rendered := strings.Join(parts, "\n")
+	c.markdownCache[text] = rendered
+	return rendered
 }
 
 // renderMarkdownSegment runs one stretch of markdown through glamour.
@@ -658,18 +685,18 @@ func (c *ChatModel) mermaidWidth() int {
 
 // PlainTranscript returns the conversation as copy-friendly plain text.
 func (c *ChatModel) PlainTranscript() string {
-	if len(c.Messages) == 0 {
+	if len(c.Messages) == 0 && len(c.CommittedMessages) == 0 {
 		return ""
 	}
 
 	var b strings.Builder
-	for _, msg := range c.Messages {
+	writeMsg := func(msg message) {
 		if msg.isMeta || strings.HasPrefix(msg.content, "Copied ") {
-			continue
+			return
 		}
 		content := strings.TrimSpace(msg.content)
 		if content == "" {
-			continue
+			return
 		}
 
 		if b.Len() > 0 {
@@ -678,6 +705,13 @@ func (c *ChatModel) PlainTranscript() string {
 		b.WriteString(transcriptLabel(msg))
 		b.WriteString("\n")
 		b.WriteString(content)
+	}
+
+	for _, msg := range c.CommittedMessages {
+		writeMsg(msg)
+	}
+	for _, msg := range c.Messages {
+		writeMsg(msg)
 	}
 	return b.String()
 }
@@ -708,6 +742,15 @@ func transcriptLabel(msg message) string {
 func (c *ChatModel) LastAssistantMessage() string {
 	for i := len(c.Messages) - 1; i >= 0; i-- {
 		msg := c.Messages[i]
+		if msg.role == "assistant" && !msg.isError && !msg.isWarning && !msg.isMeta {
+			content := strings.TrimSpace(msg.content)
+			if content != "" && !strings.HasPrefix(content, "Copied ") {
+				return content
+			}
+		}
+	}
+	for i := len(c.CommittedMessages) - 1; i >= 0; i-- {
+		msg := c.CommittedMessages[i]
 		if msg.role == "assistant" && !msg.isError && !msg.isWarning && !msg.isMeta {
 			content := strings.TrimSpace(msg.content)
 			if content != "" && !strings.HasPrefix(content, "Copied ") {
@@ -768,8 +811,11 @@ func (c *ChatModel) renderMessages(running bool) (string, []blockKind) {
 	themeKey := paletteKey(p)
 
 	if len(c.Messages) == 0 {
-		welcome := c.renderWelcome(p)
-		return welcome, make([]blockKind, strings.Count(welcome, "\n")+1)
+		if !c.HasCommitted {
+			welcome := c.renderWelcome(p)
+			return welcome, make([]blockKind, strings.Count(welcome, "\n")+1)
+		}
+		return "", nil
 	}
 
 	dim := lipgloss.NewStyle().Foreground(p.Dim)

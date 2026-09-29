@@ -858,13 +858,80 @@ func (m *model) cancelAgent() {
 	}
 }
 
+// tokenFlushInterval is the rate at which streamed tokens are flushed to the model.
+// 25ms (~40 FPS) is within the optimal 16–33ms range (~30–60 FPS) to balance fluid
+// rendering with minimal UI and Glamour CPU overhead.
+const tokenFlushInterval = 25 * time.Millisecond
+
 func (m *model) startAgentLoop(prompt string) tea.Cmd {
 	ch := make(chan agentMsg, 64)
 	m.agentCh = ch
 	agentCtx, agentCancel := context.WithCancel(m.ctx)
 	m.agentCancel = agentCancel
-	go m.runAgentLoop(agentCtx, prompt, ch, m.agentRun())
+
+	rawCh := make(chan agentMsg, 64)
+	go m.runAgentLoop(agentCtx, prompt, rawCh, m.agentRun())
+	go throttleAgentChannel(agentCtx, rawCh, ch, tokenFlushInterval)
 	return waitForAgent(m.agentCh)
+}
+
+// throttleAgentChannel buffers streamed text tokens from rawCh and flushes them to outCh
+// on a fixed tick (interval) so Bubble Tea's Update/View render path is not invoked on every
+// single token. Non-text messages and channel closure flush any buffered tokens first to
+// strictly preserve event chronology.
+func throttleAgentChannel(ctx context.Context, rawCh <-chan agentMsg, outCh chan<- agentMsg, interval time.Duration) {
+	defer close(outCh)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var textBuf strings.Builder
+	var thinkBuf strings.Builder
+
+	flushText := func() {
+		if textBuf.Len() > 0 {
+			outCh <- agentTextMsg{text: textBuf.String()}
+			textBuf.Reset()
+		}
+	}
+	flushThink := func() {
+		if thinkBuf.Len() > 0 {
+			outCh <- agentThinkingMsg{text: thinkBuf.String()}
+			thinkBuf.Reset()
+		}
+	}
+	flushAll := func() {
+		flushThink()
+		flushText()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			flushAll()
+			return
+
+		case <-ticker.C:
+			flushAll()
+
+		case msg, ok := <-rawCh:
+			if !ok {
+				flushAll()
+				return
+			}
+			switch v := msg.(type) {
+			case agentTextMsg:
+				flushThink()
+				textBuf.WriteString(v.text)
+			case agentThinkingMsg:
+				flushText()
+				thinkBuf.WriteString(v.text)
+			default:
+				flushAll()
+				outCh <- msg
+			}
+		}
+	}
 }
 
 // agentRunConfig is the slice of cfg the agent loop needs, read once on the
@@ -1930,6 +1997,8 @@ func (m *model) handleAgentDone(msg agentDoneMsg) (tea.Model, tea.Cmd) {
 	m.chatModel.Thinking = ""
 	m.agentCh = nil
 	m.refreshDiffStats()
+	commitCmd := m.commitActiveTurn()
+
 	// Every terminal outcome completes the turn, but only a successful turn has
 	// returned to an input-ready state. Do not tell lifecycle consumers that a
 	// failed or canceled run is awaiting input.
@@ -1940,9 +2009,29 @@ func (m *model) handleAgentDone(msg agentDoneMsg) (tea.Model, tea.Cmd) {
 		m.runLifecycleHooks("user_input_required", map[string]any{})
 	}
 	if len(m.pendingPrompts) > 0 {
-		return m.startNextPrompt()
+		nextM, nextCmd := m.startNextPrompt()
+		return nextM, tea.Batch(commitCmd, nextCmd)
 	}
-	return m, nil
+	return m, commitCmd
+}
+
+// commitActiveTurn renders any completed messages from the active turn,
+// emits them to the terminal's native scrollback via tea.Printf, and removes
+// them from the model's managed/rendered state.
+func (m *model) commitActiveTurn() tea.Cmd {
+	if len(m.chatModel.Messages) == 0 {
+		return nil
+	}
+	renderedTurn := m.chatModel.RenderMessages(false)
+	m.chatModel.CommittedMessages = append(m.chatModel.CommittedMessages, m.chatModel.Messages...)
+	m.chatModel.Messages = m.chatModel.Messages[:0]
+	m.chatModel.HasCommitted = true
+	m.chatModel.Scroll = 0
+
+	if strings.TrimSpace(renderedTurn) == "" {
+		return nil
+	}
+	return tea.Printf("%s", renderedTurn)
 }
 
 // runLifecycleHooks fires every configured lifecycle hook for the given event,

@@ -2258,14 +2258,15 @@ func TestUpdate_AgentDoneMsg_WithError(t *testing.T) {
 	}
 	// Error should be shown in messages.
 	found := false
-	for _, msg := range m.chatModel.Messages {
+	allMsgs := append(m.chatModel.Messages, m.chatModel.CommittedMessages...)
+	for _, msg := range allMsgs {
 		if strings.Contains(msg.content, "deadline") || strings.Contains(msg.content, "Error") || strings.Contains(msg.content, "error") {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Logf("expected error in messages, got %+v", m.chatModel.Messages)
+		t.Logf("expected error in messages, got %+v", allMsgs)
 	}
 }
 

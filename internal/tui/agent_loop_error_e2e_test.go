@@ -90,14 +90,14 @@ func TestHandleAgentDone_RendersErrorStyled(t *testing.T) {
 	m := &model{running: true}
 	m.chatModel = NewChatModel(nil)
 
-	if _, cmd := m.handleAgentDone(agentDoneMsg{err: context.DeadlineExceeded}); cmd != nil {
-		t.Errorf("handleAgentDone returned a Cmd, want nil")
+	if _, cmd := m.handleAgentDone(agentDoneMsg{err: context.DeadlineExceeded}); cmd == nil {
+		t.Errorf("handleAgentDone returned nil Cmd, want tea.Printf command")
 	}
 
-	if len(m.chatModel.Messages) != 1 {
-		t.Fatalf("got %d messages, want 1", len(m.chatModel.Messages))
+	if len(m.chatModel.CommittedMessages) != 1 {
+		t.Fatalf("got %d committed messages, want 1", len(m.chatModel.CommittedMessages))
 	}
-	got := m.chatModel.Messages[0]
+	got := m.chatModel.CommittedMessages[0]
 	if !got.isError {
 		t.Error("error message is not flagged isError -- it renders as a normal reply")
 	}

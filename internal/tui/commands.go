@@ -605,6 +605,7 @@ func (m *model) handleModelCommand(args []string) (tea.Model, tea.Cmd) {
 			role:    "assistant",
 			content: m.formatModelInfo(),
 		})
+		m.openModelMenu()
 		return m, nil
 	}
 

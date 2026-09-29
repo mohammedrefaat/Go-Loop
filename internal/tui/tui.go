@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"charm.land/bubbles/v2/list"
 	"charm.land/lipgloss/v2"
 
 	tea "charm.land/bubbletea/v2"
@@ -144,6 +145,9 @@ type model struct {
 	// Branch popup state (shown on status bar click).
 	branchPopup *branchPopupState
 
+	// Model/provider picker interactive menu.
+	modelPicker *modelPickerState
+
 	// Unified search popup for slash commands and history.
 	searchPopup *searchPopupState
 
@@ -274,6 +278,7 @@ type searchPopupState struct {
 	search    string       // current search query
 	height    int          // popup height (number of visible items)
 	scrollOff int          // scroll offset when more entries than height
+	list      list.Model   // bubbles interactive list model
 }
 
 // searchMode determines what the popup displays.
@@ -372,6 +377,31 @@ func (m *model) newSearchPopup(mode searchMode) {
 	}
 	popupHeight := searchPopupListHeight(len(items), availableRows)
 
+	listItems := make([]list.Item, 0, len(items))
+	for _, it := range items {
+		listItems = append(listItems, MenuItem{
+			title:       it.Text,
+			description: it.Description,
+			filterVal:   it.Text + " " + it.Description,
+			value:       it.Text,
+		})
+	}
+	delegate := list.NewDefaultDelegate()
+	delegate.ShowDescription = (mode == searchModeCommands)
+	delegate.SetHeight(1)
+	if mode == searchModeCommands {
+		delegate.SetHeight(2)
+	}
+	delegate.SetSpacing(0)
+
+	l := list.New(listItems, delegate, max(24, m.chatWidth()-4), max(4, popupHeight))
+	l.SetFilteringEnabled(true)
+	l.SetShowTitle(false)
+	l.SetShowStatusBar(false)
+	l.SetShowPagination(false)
+	l.SetShowHelp(false)
+	l.DisableQuitKeybindings()
+
 	m.searchPopup = &searchPopupState{
 		mode:      mode,
 		entries:   items,
@@ -380,6 +410,7 @@ func (m *model) newSearchPopup(mode searchMode) {
 		search:    "",
 		height:    popupHeight,
 		scrollOff: 0,
+		list:      l,
 	}
 }
 
@@ -444,6 +475,7 @@ func (sp *searchPopupState) filterSearch() {
 		sp.filtered = sp.entries
 		sp.selected = 0
 		sp.scrollOff = 0
+		sp.syncListItems()
 		return
 	}
 	q := strings.ToLower(sp.search)
@@ -459,6 +491,30 @@ func (sp *searchPopupState) filterSearch() {
 	sp.filtered = filtered
 	sp.selected = 0
 	sp.scrollOff = 0
+	sp.syncListItems()
+}
+
+func (sp *searchPopupState) hasList() bool {
+	return sp != nil && len(sp.list.Items()) > 0 && sp.list.Paginator.PerPage > 0
+}
+
+func (sp *searchPopupState) syncListItems() {
+	if !sp.hasList() && (sp == nil || sp.list.Paginator.PerPage == 0) {
+		return
+	}
+	listItems := make([]list.Item, len(sp.filtered))
+	for i, it := range sp.filtered {
+		listItems[i] = MenuItem{
+			title:       it.Text,
+			description: it.Description,
+			filterVal:   it.Text + " " + it.Description,
+			value:       it.Text,
+		}
+	}
+	sp.list.SetItems(listItems)
+	if sp.hasList() {
+		sp.list.Select(sp.selected)
+	}
 }
 
 // syncPalette resolves the active theme's palette and fans it out to every
@@ -1083,6 +1139,12 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.Key()
 
 	// Overlays get first refusal, even while the agent runs.
+	if m.modelPicker != nil {
+		if model, cmd, handled := m.handleModelPickerKey(msg); handled {
+			return model, cmd
+		}
+	}
+
 	for _, handle := range []keyHandler{
 		m.handleCommitKey,
 		m.handleLoginKey,
@@ -1213,6 +1275,10 @@ func (m *model) handleBranchPopupKey(key tea.Key) (tea.Model, tea.Cmd, bool) {
 func (m *model) handleInterruptKey(key tea.Key) (tea.Model, tea.Cmd, bool) {
 	switch {
 	case key.Code == tea.KeyEsc:
+		if m.modelPicker != nil {
+			m.modelPicker = nil
+			return m, nil, true
+		}
 		if m.searchPopup != nil {
 			m.searchPopup = nil
 			return m, nil, true
@@ -1413,6 +1479,9 @@ func (sp *searchPopupState) selectPrev() {
 		sp.selected = len(sp.filtered) - 1
 	}
 	sp.scrollOff = max(0, sp.selected-sp.height+1)
+	if sp.hasList() {
+		sp.list.Select(sp.selected)
+	}
 }
 
 // selectNext moves the selection down one, wrapping to the first item from the
@@ -1426,6 +1495,9 @@ func (sp *searchPopupState) selectNext() {
 	}
 	if sp.selected >= sp.scrollOff+sp.height {
 		sp.scrollOff = sp.selected - sp.height + 1
+	}
+	if sp.hasList() {
+		sp.list.Select(sp.selected)
 	}
 }
 
@@ -1447,6 +1519,9 @@ func (sp *searchPopupState) selectByTab(backwards bool) {
 		sp.selected++
 	}
 	sp.scrollOff = max(0, sp.selected-sp.height+1)
+	if sp.hasList() {
+		sp.list.Select(sp.selected)
+	}
 }
 
 // acceptSearchPopupSelection puts the selected item into the prompt and closes
@@ -1504,9 +1579,31 @@ func (m *model) View() tea.View {
 	// Calculate available height for messages.
 	availableHeight := m.messageViewportHeight()
 
-	// Truncate messages to fit viewport.
-	visibleMessages, startLine, endLine := clipMessagesToViewport(
-		messagesView, availableHeight, m.chatModel.Scroll)
+	// Truncate messages to fit viewport for in-progress turns or startup screen;
+	// committed history is emitted to native terminal scrollback and not re-rendered.
+	var visibleMessages string
+	var startLine, endLine int
+	if m.chatModel.HasCommitted && len(m.chatModel.Messages) == 0 {
+		visibleMessages = ""
+		startLine, endLine = 0, 0
+		if m.modelPicker != nil {
+			picker := m.renderModelPicker(max(30, min(bodyWidth-4, 80)))
+			if picker != "" {
+				count := strings.Count(picker, "\n") + 1
+				visibleMessages = strings.Repeat("\n ", count)
+			}
+		} else if m.searchPopup != nil {
+			popup := m.renderSearchPopup(max(0, bodyWidth-4))
+			if popup != "" {
+				count := strings.Count(popup, "\n") + 1
+				visibleMessages = strings.Repeat("\n ", count)
+			}
+		}
+	} else {
+		visibleMessages, startLine, endLine = clipMessagesToViewport(
+			messagesView, availableHeight, m.chatModel.Scroll)
+	}
+	visibleMessages = m.overlayModelPicker(visibleMessages, bodyWidth)
 	visibleMessages = m.overlaySearchPopup(visibleMessages, bodyWidth)
 
 	// Note: width constraint is handled by glamour's WithWordWrap(contentWidth) in chatModel.UpdateRenderer.
@@ -2395,7 +2492,7 @@ func (m *model) handleInitEvent(msg initEventMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) shouldShowSlashCommandPopup() bool {
-	if m.running || m.loading || m.login != nil || m.commit != nil || m.pendingSkillCreate != nil {
+	if m.running || m.loading || m.login != nil || m.commit != nil || m.pendingSkillCreate != nil || m.modelPicker != nil {
 		return false
 	}
 	text := m.inputModel.Text

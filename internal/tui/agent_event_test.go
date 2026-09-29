@@ -1411,7 +1411,8 @@ func TestAgentDoneMsg_WithError(t *testing.T) {
 	newM, _ := m.Update(agentDoneMsg{err: fmt.Errorf("connection lost")})
 	mm := newM.(*model)
 	found := false
-	for _, msg := range mm.chatModel.Messages {
+	allMsgs := append(mm.chatModel.Messages, mm.chatModel.CommittedMessages...)
+	for _, msg := range allMsgs {
 		if strings.Contains(msg.content, "connection lost") {
 			found = true
 			break
