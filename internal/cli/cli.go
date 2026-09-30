@@ -70,6 +70,7 @@ var (
 	flagSlow         bool
 	flagPlan         bool
 	flagMemoryOff    bool
+	flagNoMouse      bool
 	flagLSP          string
 	flagSystem       string
 	flagPprof        string
@@ -224,6 +225,7 @@ Set a default in ~/.pi-go/config.json so --model is only needed to deviate;
 	cmd.Flags().BoolVar(&flagInsecure, "insecure", false, "Skip TLS certificate verification for LLM API calls")
 	cmd.Flags().StringVar(&flagCACert, "ca-cert", "", "PEM bundle to trust for LLM API calls, in addition to the system roots")
 	cmd.Flags().BoolVar(&flagMemoryOff, "memory-off", false, "Disable the persistent memory system for this session")
+	cmd.Flags().BoolVar(&flagNoMouse, "no-mouse", false, "Disable mouse capture in the TUI (enables native terminal text selection)")
 	cmd.Flags().StringVar(&flagLSP, "lsp", "min", "Language-server tools: off, min (symbols+diagnostics), or full (all seven)")
 	// Persistent, not local: `pi memory mine . --pprof true` and every other
 	// subcommand must accept these too. As local flags they were rejected with
@@ -318,6 +320,9 @@ func loadRootConfig() (config.Config, error) {
 	}
 	if flagModel != "" {
 		cfg.Roles["default"] = config.RoleConfig{Model: flagModel}
+	}
+	if flagNoMouse || os.Getenv("PI_NO_MOUSE") == "1" || os.Getenv("PI_NO_MOUSE") == "true" {
+		cfg.NoMouse = true
 	}
 	return cfg, nil
 }

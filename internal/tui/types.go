@@ -78,6 +78,9 @@ type Config struct {
 	MCPServers []extension.MCPServerConfig
 	// A2A holds the configured A2A agent endpoints, shown in the sidebar.
 	A2A *config.A2AConfig
+	// NoMouse disables mouse event capture in the terminal, allowing native
+	// text selection and clipboard copying without holding Shift.
+	NoMouse bool
 
 	// ModelSwitcher creates a new LLM instance for the given model name,
 	// updates the token tracker's context window size, and returns the

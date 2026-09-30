@@ -205,3 +205,64 @@ func TestViewEnablesMouseReporting(t *testing.T) {
 		t.Error("AltScreen = true; the UI is meant to stay on the normal screen")
 	}
 }
+
+func TestViewDisablesMouseReportingWhenNoMouse(t *testing.T) {
+	m := historyModel(t, "first")
+	m.noMouse = true
+	m.chatModel.Messages = append(m.chatModel.Messages,
+		message{role: "assistant", content: "hello"})
+
+	v := m.View()
+
+	if v.MouseMode != tea.MouseModeNone {
+		t.Fatalf("MouseMode = %v, want MouseModeNone so native terminal selection works", v.MouseMode)
+	}
+}
+
+func TestHandleMouseCommandTogglesMouseMode(t *testing.T) {
+	m := historyModel(t, "first")
+	m.noMouse = false
+
+	// Toggle off
+	newM, _ := m.handleSlashCommand("/mouse off")
+	mm := newM.(*model)
+	if !mm.noMouse {
+		t.Error("expected noMouse to be true after /mouse off")
+	}
+	if v := mm.View(); v.MouseMode != tea.MouseModeNone {
+		t.Errorf("MouseMode = %v, want MouseModeNone", v.MouseMode)
+	}
+
+	// Toggle on
+	newM, _ = mm.handleSlashCommand("/mouse on")
+	mm = newM.(*model)
+	if mm.noMouse {
+		t.Error("expected noMouse to be false after /mouse on")
+	}
+	if v := mm.View(); v.MouseMode != tea.MouseModeCellMotion {
+		t.Errorf("MouseMode = %v, want MouseModeCellMotion", v.MouseMode)
+	}
+
+	// Toggle bare
+	newM, _ = mm.handleSlashCommand("/mouse")
+	mm = newM.(*model)
+	if !mm.noMouse {
+		t.Error("expected noMouse to toggle to true")
+	}
+}
+
+func TestDragOnCommittedScrollbackFlashesTip(t *testing.T) {
+	m := historyModel(t, "first")
+	m.chatModel.HasCommitted = true
+	m.chatModel.Messages = nil
+	m.View()
+
+	// Simulate drag and release when no active messages in frame
+	m.sel = selection{dragging: true, present: true, anchorX: 5, anchorY: 5, cursorX: 10, cursorY: 5}
+	newM, _ := m.handleMouseRelease(tea.MouseReleaseMsg{})
+	mm := newM.(*model)
+	if mm.flash != "Tip: Hold Shift to select scrollback, or use /copy" {
+		t.Errorf("flash = %q, want scrollback copy tip", mm.flash)
+	}
+}
+

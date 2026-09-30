@@ -127,6 +127,7 @@ var slashCommandSpecs = []slashCommandSpec{
 	{name: "/skill-load", desc: "Reload skills from disk", hidden: true, run: slashCmdBare((*model).handleSkillLoadCommand)},
 	{name: "/skill-create", desc: "Create a new skill", hidden: true, run: (*model).handleSkillCreateCommand},
 	{name: "/theme", desc: "Switch theme or list themes", run: (*model).handleThemeCommand},
+	{name: "/mouse", desc: "Toggle mouse capture (on/off)", run: (*model).handleMouseCommand},
 	{name: "/ping", desc: "Test LLM connectivity", run: (*model).handlePingCommand},
 	{name: "/model-price-refresh", desc: "Refresh model prices from models.dev", run: (*model).handleModelPriceRefreshCommand},
 	{name: "/rtk", desc: "Output compaction stats", run: slashCmdArgs((*model).handleRTKCommand)},
@@ -285,6 +286,36 @@ func (m *model) handleCopyCommand(args []string) (tea.Model, tea.Cmd) {
 		isMeta:  true,
 	})
 	return m, tea.SetClipboard(text)
+}
+
+// handleMouseCommand handles /mouse [on|off] to toggle mouse reporting mode.
+func (m *model) handleMouseCommand(args []string) (tea.Model, tea.Cmd) {
+	if len(args) > 0 {
+		arg := strings.ToLower(strings.TrimSpace(args[0]))
+		switch arg {
+		case "off", "disable", "false", "0":
+			m.noMouse = true
+		case "on", "enable", "true", "1":
+			m.noMouse = false
+		default:
+			m.noMouse = !m.noMouse
+		}
+	} else {
+		m.noMouse = !m.noMouse
+	}
+
+	var status string
+	if m.noMouse {
+		status = "Mouse capture disabled (native terminal text selection enabled)."
+	} else {
+		status = "Mouse capture enabled (mouse wheel scrolling enabled)."
+	}
+	m.chatModel.Messages = append(m.chatModel.Messages, message{
+		role:    "assistant",
+		content: status,
+		isMeta:  true,
+	})
+	return m, m.setFlash(status)
 }
 
 // handleBranchCommand handles /branch subcommands: create, switch, list.
@@ -1026,6 +1057,7 @@ func (m *model) formatHelp() string {
 	b.WriteString("| Command | Description |\n")
 	b.WriteString("|---------|-------------|\n")
 	b.WriteString("| `/theme [name]` | List or switch themes |\n")
+	b.WriteString("| `/mouse [on/off]` | Toggle mouse capture (disabling allows native copy) |\n")
 
 	b.WriteString("\n**System:**\n\n")
 	b.WriteString("| Command | Description |\n")

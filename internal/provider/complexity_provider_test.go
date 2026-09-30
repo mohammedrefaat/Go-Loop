@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go"
-	ollamaapi "github.com/ollama/ollama/api"
 	"github.com/openai/openai-go/v3/responses"
 	"github.com/openai/openai-go/v3/shared"
 	"google.golang.org/adk/v2/model"
@@ -1263,14 +1262,14 @@ func TestOllamaStreamState_HandleChunk(t *testing.T) {
 	state := &ollamaStreamState{yield: collectYield(&got, 0)}
 
 	// Out-of-band reasoning, then inline reasoning, then the answer.
-	chunks := []ollamaapi.ChatResponse{
-		{Message: ollamaapi.Message{Thinking: "out of band"}},
-		{Message: ollamaapi.Message{Content: "<think>inline</think>answer"}},
+	chunks := []ollamaChatResponse{
+		{Message: ollamaChatMessage{Thinking: "out of band"}},
+		{Message: ollamaChatMessage{Content: "<think>inline</think>answer"}},
 		{
-			Message:    ollamaapi.Message{ToolCalls: []ollamaapi.ToolCall{{ID: "tc1", Function: ollamaapi.ToolCallFunction{Name: "fn"}}}},
+			Message:    ollamaChatMessage{ToolCalls: []ollamaToolCall{{ID: "tc1", Function: ollamaToolCallFunction{Name: "fn"}}}},
 			Done:       true,
 			DoneReason: "stop",
-			Metrics:    ollamaapi.Metrics{PromptEvalCount: 11, EvalCount: 22},
+			Metrics:    ollamaMetrics{PromptEvalCount: 11, EvalCount: 22},
 		},
 	}
 	for i, c := range chunks {
@@ -1349,16 +1348,16 @@ func TestOllamaStreamState_EmitPropagatesCancel(t *testing.T) {
 	})
 	t.Run("handleChunk propagates", func(t *testing.T) {
 		state := &ollamaStreamState{yield: stop}
-		if err := state.handleChunk(ollamaapi.ChatResponse{
-			Message: ollamaapi.Message{Thinking: "x"},
+		if err := state.handleChunk(ollamaChatResponse{
+			Message: ollamaChatMessage{Thinking: "x"},
 		}); err == nil {
 			t.Error("handleChunk err = nil, want cancellation error")
 		}
 	})
 	t.Run("handleChunk propagates from content", func(t *testing.T) {
 		state := &ollamaStreamState{yield: stop}
-		if err := state.handleChunk(ollamaapi.ChatResponse{
-			Message: ollamaapi.Message{Content: "plain"},
+		if err := state.handleChunk(ollamaChatResponse{
+			Message: ollamaChatMessage{Content: "plain"},
 		}); err == nil {
 			t.Error("handleChunk err = nil, want cancellation error")
 		}
@@ -1370,7 +1369,7 @@ func TestOllamaStreamState_EmitPropagatesCancel(t *testing.T) {
 		if _, text := state.splitter.split("hello<thi"); text != "hello" {
 			t.Fatalf("split text = %q, want %q", text, "hello")
 		}
-		if err := state.handleChunk(ollamaapi.ChatResponse{Done: true}); err == nil {
+		if err := state.handleChunk(ollamaChatResponse{Done: true}); err == nil {
 			t.Error("handleChunk err = nil, want cancellation error")
 		}
 	})
@@ -1397,7 +1396,7 @@ func TestOllamaStreamState_FinalParts(t *testing.T) {
 			name: "no thinking fallback when a tool was called",
 			state: &ollamaStreamState{
 				aggregatedThinking: "reasoning",
-				toolCalls:          []ollamaapi.ToolCall{{ID: "tc1"}},
+				toolCalls:          []ollamaToolCall{{ID: "tc1"}},
 			},
 			wantTexts: nil,
 			wantCalls: 1,

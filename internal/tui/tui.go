@@ -93,6 +93,9 @@ type model struct {
 	sel       selection
 	lastFrame string
 	frameRows int
+	// noMouse disables terminal mouse reporting when true, allowing the user
+	// to use native terminal selection and copy without holding Shift.
+	noMouse bool
 	// sessionTitle is the title derived from the user's most recent prompt. It
 	// is surfaced to the terminal via View().WindowTitle so Bubble Tea's
 	// renderer emits the escape sequence in-band with the frame it draws.
@@ -578,6 +581,7 @@ func newModel(ctx context.Context, cancel context.CancelFunc, cfg Config) *model
 
 	m := &model{
 		cfg:          cfg,
+		noMouse:      cfg.NoMouse,
 		ctx:          ctx,
 		cancel:       cancel,
 		inputModel:   NewInputModel(history, cfg.Skills, cfg.SkillDirs, cfg.WorkDir),
@@ -867,6 +871,9 @@ func (m *model) handlePaste(msg tea.PasteMsg) (tea.Model, tea.Cmd, bool) {
 
 // handleMouse dispatches to the click, drag, release and wheel handlers.
 func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.noMouse {
+		return m, nil
+	}
 	switch msg := msg.(type) {
 	case tea.MouseClickMsg:
 		return m.handleMouseClick(msg)
@@ -1084,10 +1091,23 @@ func (m *model) handleMouseRelease(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd)
 	m.sel.dragging = false
 
 	if m.sel.empty() {
+		wasDragging := m.sel.present
 		m.sel = selection{} // a plain click, not a drag: just clear
+		if wasDragging && m.chatModel.HasCommitted && len(m.chatModel.Messages) == 0 {
+			return m, m.setFlash("Tip: Hold Shift to select scrollback, or use /copy")
+		}
 		return m, nil
 	}
-	return m, m.copyAndFlash(selectedText(m.lastFrame, m.sel, m.chatWidth()))
+
+	text := selectedText(m.lastFrame, m.sel, m.chatWidth())
+	if strings.TrimSpace(text) == "" {
+		m.sel = selection{}
+		if m.chatModel.HasCommitted && len(m.chatModel.Messages) == 0 {
+			return m, m.setFlash("Tip: Hold Shift to select scrollback, or use /copy")
+		}
+		return m, nil
+	}
+	return m, m.copyAndFlash(text)
 }
 
 // clampToChat converts a mouse position into a chat-panel cell.
@@ -1786,7 +1806,11 @@ func (m *model) View() tea.View {
 	// selection.go. CellMotion is the narrowest mode that carries wheel events;
 	// Bubble Tea has no wheel-only mode.
 	v.AltScreen = false
-	v.MouseMode = tea.MouseModeCellMotion
+	if m.noMouse {
+		v.MouseMode = tea.MouseModeNone
+	} else {
+		v.MouseMode = tea.MouseModeCellMotion
+	}
 	return v
 }
 

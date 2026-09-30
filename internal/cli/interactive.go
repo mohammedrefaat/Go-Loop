@@ -176,7 +176,8 @@ func runInteractive(
 		ModelSwitcher: func(switchCtx context.Context, modelName string) (adkmodel.LLM, string, string, error) {
 			return buildSwitchedLLM(switchCtx, cfg, tokenTracker, modelName)
 		},
-		A2A: cfg.A2A,
+		A2A:     cfg.A2A,
+		NoMouse: cfg.NoMouse,
 	})
 
 	initCancel() // signal deferred init to stop

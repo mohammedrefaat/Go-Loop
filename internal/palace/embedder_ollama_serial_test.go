@@ -7,27 +7,21 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
-
-	"github.com/ollama/ollama/api"
 )
 
 // newTestOllamaEmbedder builds an embedder pointed at srv, bypassing
 // NewOllamaEmbedder's reachability probe (which would need a /api/tags route).
 func newTestOllamaEmbedder(t *testing.T, srv *httptest.Server) *ollamaEmbedder {
 	t.Helper()
-	u, err := url.Parse(srv.URL)
-	if err != nil {
-		t.Fatalf("parsing test server URL: %v", err)
-	}
 	return &ollamaEmbedder{
-		client: api.NewClient(u, srv.Client()),
-		model:  "test-model",
+		httpClient: srv.Client(),
+		baseURL:    srv.URL,
+		model:      "test-model",
 	}
 }
 

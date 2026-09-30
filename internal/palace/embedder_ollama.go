@@ -1,7 +1,9 @@
 package palace
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,8 +15,6 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
-	"github.com/ollama/ollama/api"
 )
 
 const (
@@ -86,8 +86,9 @@ var ErrOllamaUnavailable = errors.New("ollama unavailable")
 // while drawer_service embeds on every search and add — so the serialization
 // has to live at the one point they all funnel through, which is here.
 type ollamaEmbedder struct {
-	client *api.Client
-	model  string
+	httpClient *http.Client
+	baseURL    string
+	model      string
 
 	// mu serializes Embed across every caller in the process, and guards batch.
 	mu sync.Mutex
@@ -121,12 +122,12 @@ func NewOllamaEmbedder(baseURL, model string) (Embedder, error) {
 	// A generous client timeout, with the short deadline applied per-request via
 	// context below. A large embed batch legitimately takes minutes; only the
 	// reachability probe should fail fast.
-	client := api.NewClient(u, &http.Client{Timeout: 10 * time.Minute})
+	httpClient := &http.Client{Timeout: 10 * time.Minute}
 
 	ctx, cancel := context.WithTimeout(context.Background(), ollamaProbeTimeout)
 	defer cancel()
 
-	models, err := client.List(ctx)
+	models, err := fetchOllamaModelList(ctx, httpClient, u.String())
 	if err != nil {
 		return nil, fmt.Errorf("%w: cannot reach daemon at %s: %w", ErrOllamaUnavailable, baseURL, err)
 	}
@@ -134,12 +135,50 @@ func NewOllamaEmbedder(baseURL, model string) (Embedder, error) {
 		return nil, fmt.Errorf("%w: model %q is not pulled on %s", ErrOllamaUnavailable, model, baseURL)
 	}
 
-	return &ollamaEmbedder{client: client, model: model}, nil
+	return &ollamaEmbedder{
+		httpClient: httpClient,
+		baseURL:    u.String(),
+		model:      model,
+	}, nil
+}
+
+type ollamaModelList struct {
+	Models []struct {
+		Name string `json:"name"`
+	} `json:"models"`
+}
+
+func fetchOllamaModelList(ctx context.Context, client *http.Client, baseURL string) (*ollamaModelList, error) {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	tagsURL := u.ResolveReference(&url.URL{Path: "/api/tags"}).String()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, tagsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	var list ollamaModelList
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, err
+	}
+	return &list, nil
 }
 
 // hasOllamaModel reports whether name is in the daemon's model list, tolerating
 // the ":latest" suffix Ollama adds to unqualified names.
-func hasOllamaModel(list *api.ListResponse, name string) bool {
+func hasOllamaModel(list *ollamaModelList, name string) bool {
 	if list == nil {
 		return false
 	}
@@ -220,7 +259,11 @@ func (o *ollamaEmbedder) shrinkLocked() bool {
 // Embedding is a pure function of its input, so retrying is always safe. Only
 // transport-shaped failures are retried; a bad model name or a malformed
 // request fails the same way every time and should surface immediately.
-func (o *ollamaEmbedder) embedBatchWithRetry(batch []string) (*api.EmbedResponse, error) {
+type ollamaEmbedResponse struct {
+	Embeddings [][]float32 `json:"embeddings"`
+}
+
+func (o *ollamaEmbedder) embedBatchWithRetry(batch []string) (*ollamaEmbedResponse, error) {
 	var lastErr error
 	for attempt := range ollamaEmbedRetries {
 		if attempt > 0 {
@@ -231,10 +274,7 @@ func (o *ollamaEmbedder) embedBatchWithRetry(batch []string) (*api.EmbedResponse
 				"attempt", attempt+1, "of", ollamaEmbedRetries, "size", len(batch), "error", lastErr)
 		}
 
-		resp, err := o.client.Embed(context.Background(), &api.EmbedRequest{
-			Model: o.model,
-			Input: batch,
-		})
+		resp, err := o.postEmbed(context.Background(), batch)
 		if err == nil {
 			return resp, nil
 		}
@@ -244,6 +284,43 @@ func (o *ollamaEmbedder) embedBatchWithRetry(batch []string) (*api.EmbedResponse
 		}
 	}
 	return nil, fmt.Errorf("palace: ollama embed failed after %d attempts: %w", ollamaEmbedRetries, lastErr)
+}
+
+func (o *ollamaEmbedder) postEmbed(ctx context.Context, batch []string) (*ollamaEmbedResponse, error) {
+	u, err := url.Parse(o.baseURL)
+	if err != nil {
+		return nil, err
+	}
+	embedURL := u.ResolveReference(&url.URL{Path: "/api/embed"}).String()
+	payload, err := json.Marshal(map[string]any{
+		"model": o.model,
+		"input": batch,
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, embedURL, bytes.NewReader(payload))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := o.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		b, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+
+	var embedResp ollamaEmbedResponse
+	if err := json.NewDecoder(resp.Body).Decode(&embedResp); err != nil {
+		return nil, err
+	}
+	return &embedResp, nil
 }
 
 // isTransientOllamaErr reports whether err looks like the daemon or its model

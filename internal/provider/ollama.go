@@ -1,9 +1,13 @@
 package provider
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"net/http"
 	"net/url"
@@ -13,8 +17,6 @@ import (
 	"strings"
 	"time"
 
-	ollamaapi "github.com/ollama/ollama/api"
-	ollamamodel "github.com/ollama/ollama/types/model"
 	"google.golang.org/adk/v2/model"
 	"google.golang.org/genai"
 )
@@ -22,7 +24,7 @@ import (
 // ollamaModel implements model.LLM for the native Ollama API.
 type ollamaModel struct {
 	modelName     string
-	client        *ollamaapi.Client
+	client        *ollamaClient
 	thinkingLevel string // "none", "low", "medium", "high"
 }
 
@@ -144,7 +146,7 @@ func NewOllama(_ context.Context, r OllamaRouting, thinkingLevel string, opts *L
 			token: apiKey,
 		}
 	}
-	client := ollamaapi.NewClient(u, httpClient)
+	client := &ollamaClient{baseURL: u, httpClient: httpClient}
 	return &ollamaModel{
 		modelName:     modelName,
 		client:        client,
@@ -192,12 +194,12 @@ func (m *ollamaModel) GenerateContent(ctx context.Context, req *model.LLMRequest
 // The old test also only matched ":cloud", never the ":<size>-cloud" form that
 // most of the cloud catalog uses, so it silently did nothing for those models —
 // the routing checks in config.go and provider.go accept both suffixes.
-func (m *ollamaModel) buildChatRequest(req *model.LLMRequest) *ollamaapi.ChatRequest {
+func (m *ollamaModel) buildChatRequest(req *model.LLMRequest) *ollamaChatRequest {
 	messages, systemPrompt := ollamaContentsToMessages(req.Contents, req.Config)
 
 	// Prepend system message if present.
 	if systemPrompt != "" {
-		messages = append([]ollamaapi.Message{{Role: "system", Content: systemPrompt}}, messages...)
+		messages = append([]ollamaChatMessage{{Role: "system", Content: systemPrompt}}, messages...)
 	}
 
 	modelName := m.modelName
@@ -205,7 +207,7 @@ func (m *ollamaModel) buildChatRequest(req *model.LLMRequest) *ollamaapi.ChatReq
 		modelName = req.Model
 	}
 
-	chatReq := &ollamaapi.ChatRequest{
+	chatReq := &ollamaChatRequest{
 		Model:    modelName,
 		Messages: messages,
 		Options:  ollamaChatOptions(),
@@ -237,9 +239,9 @@ func ollamaChatOptions() map[string]any {
 // ollamaThinkValue resolves the think field for one request. nothink models must
 // not have thinking forced on, whichever level the session is running at; a nil
 // result leaves the field off so the model's own default applies.
-func ollamaThinkValue(modelName, thinkingLevel string) *ollamaapi.ThinkValue {
+func ollamaThinkValue(modelName, thinkingLevel string) *ollamaThink {
 	if strings.Contains(strings.ToLower(modelName), "nothink") {
-		return &ollamaapi.ThinkValue{Value: false}
+		return &ollamaThink{Value: false}
 	}
 	return ollamaThinkingConfig(thinkingLevel)
 }
@@ -251,12 +253,12 @@ func ollamaThinkValue(modelName, thinkingLevel string) *ollamaapi.ThinkValue {
 // gemma-4 then think anyway, spending latency and tokens the user asked to
 // avoid. Unrecognized levels (including "") still return nil so the model
 // default applies.
-func ollamaThinkingConfig(level string) *ollamaapi.ThinkValue {
+func ollamaThinkingConfig(level string) *ollamaThink {
 	switch level {
 	case "none":
-		return &ollamaapi.ThinkValue{Value: false}
+		return &ollamaThink{Value: false}
 	case "low", "medium", "high":
-		return &ollamaapi.ThinkValue{Value: level}
+		return &ollamaThink{Value: level}
 	default:
 		return nil
 	}
@@ -360,11 +362,11 @@ func ollamaFinishReasonToGenai(reason string) genai.FinishReason {
 }
 
 // ollamaContentsToMessages converts genai.Content to Ollama messages.
-func ollamaContentsToMessages(contents []*genai.Content, config *genai.GenerateContentConfig) ([]ollamaapi.Message, string) {
+func ollamaContentsToMessages(contents []*genai.Content, config *genai.GenerateContentConfig) ([]ollamaChatMessage, string) {
 	systemPrompt := genaiSystemInstruction(config)
 	functionResponses := genaiFunctionResponses(contents)
 
-	var messages []ollamaapi.Message
+	var messages []ollamaChatMessage
 	for _, content := range contents {
 		if content == nil {
 			continue
@@ -386,7 +388,7 @@ func ollamaContentsToMessages(contents []*genai.Content, config *genai.GenerateC
 
 	// Ensure at least one message.
 	if len(messages) == 0 {
-		messages = append(messages, ollamaapi.Message{
+		messages = append(messages, ollamaChatMessage{
 			Role:    "user",
 			Content: "Hello",
 		})
@@ -402,31 +404,31 @@ func ollamaToolCallMessages(
 	textParts []string,
 	functionCalls []*genai.FunctionCall,
 	functionResponses map[string]*genai.FunctionResponse,
-) []ollamaapi.Message {
+) []ollamaChatMessage {
 	// Assistant message with tool calls.
-	toolCalls := make([]ollamaapi.ToolCall, 0, len(functionCalls))
+	toolCalls := make([]ollamaToolCall, 0, len(functionCalls))
 	for _, fc := range functionCalls {
-		args := ollamaapi.NewToolCallFunctionArguments()
+		args := make(ollamaToolArguments, len(fc.Args))
 		for k, v := range fc.Args {
-			args.Set(k, v)
+			args[k] = v
 		}
-		toolCalls = append(toolCalls, ollamaapi.ToolCall{
+		toolCalls = append(toolCalls, ollamaToolCall{
 			ID: fc.ID,
-			Function: ollamaapi.ToolCallFunction{
+			Function: ollamaToolCallFunction{
 				Name:      fc.Name,
 				Arguments: args,
 			},
 		})
 	}
 
-	msg := ollamaapi.Message{
+	msg := ollamaChatMessage{
 		Role:      "assistant",
 		ToolCalls: toolCalls,
 	}
 	if len(textParts) > 0 {
 		msg.Content = strings.Join(textParts, "\n")
 	}
-	messages := make([]ollamaapi.Message, 0, 1+len(functionCalls))
+	messages := make([]ollamaChatMessage, 0, 1+len(functionCalls))
 	messages = append(messages, msg)
 
 	// Tool results as separate messages.
@@ -435,7 +437,7 @@ func ollamaToolCallMessages(
 		if fr := functionResponses[fc.ID]; fr != nil {
 			contentStr = oaiFunctionResponseContent(fr.Response) // reuse helper
 		}
-		messages = append(messages, ollamaapi.Message{
+		messages = append(messages, ollamaChatMessage{
 			Role:       "tool",
 			Content:    contentStr,
 			ToolCallID: fc.ID,
@@ -446,20 +448,20 @@ func ollamaToolCallMessages(
 
 // ollamaTextMessage renders a text-only turn under the Ollama role its genai
 // role maps to.
-func ollamaTextMessage(role, text string) ollamaapi.Message {
+func ollamaTextMessage(role, text string) ollamaChatMessage {
 	msgRole := "user"
 	if genaiIsAssistantRole(role) {
 		msgRole = "assistant"
 	}
-	return ollamaapi.Message{
+	return ollamaChatMessage{
 		Role:    msgRole,
 		Content: text,
 	}
 }
 
 // ollamaGenaiToolsToOllama converts genai tools to Ollama native tool format.
-func ollamaGenaiToolsToOllama(tools []*genai.Tool) ollamaapi.Tools {
-	var out ollamaapi.Tools
+func ollamaGenaiToolsToOllama(tools []*genai.Tool) ollamaTools {
+	var out ollamaTools
 	for _, t := range tools {
 		if t == nil {
 			continue
@@ -468,9 +470,9 @@ func ollamaGenaiToolsToOllama(tools []*genai.Tool) ollamaapi.Tools {
 			if fd == nil {
 				continue
 			}
-			out = append(out, ollamaapi.Tool{
+			out = append(out, ollamaTool{
 				Type: "function",
-				Function: ollamaapi.ToolFunction{
+				Function: ollamaToolFunction{
 					Name:        fd.Name,
 					Description: fd.Description,
 					Parameters:  ollamaToolParameters(fd.ParametersJsonSchema),
@@ -485,10 +487,10 @@ func ollamaGenaiToolsToOllama(tools []*genai.Tool) ollamaapi.Tools {
 // parameter object. The Properties map is always allocated, even for a
 // declaration that takes no arguments, and Required is left nil unless the
 // schema carries a list with at least one string in it.
-func ollamaToolParameters(rawSchema any) ollamaapi.ToolFunctionParameters {
-	params := ollamaapi.ToolFunctionParameters{
+func ollamaToolParameters(rawSchema any) ollamaToolFunctionParameters {
+	params := ollamaToolFunctionParameters{
 		Type:       "object",
-		Properties: ollamaapi.NewToolPropertiesMap(),
+		Properties: newToolPropertiesMap(),
 	}
 	m := schemaToMap(rawSchema)
 	if m == nil {
@@ -548,14 +550,14 @@ func schemaToMap(raw any) map[string]any {
 }
 
 // convertToToolProperty converts a raw JSON schema property to Ollama ToolProperty.
-func convertToToolProperty(raw any) ollamaapi.ToolProperty {
-	prop := ollamaapi.ToolProperty{}
+func convertToToolProperty(raw any) ollamaToolProperty {
+	prop := ollamaToolProperty{}
 	m, ok := raw.(map[string]any)
 	if !ok {
 		return prop
 	}
 	if t, ok := m["type"].(string); ok {
-		prop.Type = ollamaapi.PropertyType{t}
+		prop.Type = ollamaPropertyType{t}
 	}
 	if d, ok := m["description"].(string); ok {
 		prop.Description = d
@@ -574,7 +576,7 @@ type ollamaStreamState struct {
 
 	aggregatedText     string
 	aggregatedThinking string
-	toolCalls          []ollamaapi.ToolCall
+	toolCalls          []ollamaToolCall
 	doneReason         string
 	promptTokens       int
 	evalTokens         int
@@ -623,7 +625,7 @@ func (s *ollamaStreamState) emitSplit(thinking, text string) error {
 }
 
 // handleChunk folds one streamed chat response into the state.
-func (s *ollamaStreamState) handleChunk(resp ollamaapi.ChatResponse) error {
+func (s *ollamaStreamState) handleChunk(resp ollamaChatResponse) error {
 	msg := resp.Message
 
 	// Reasoning that Ollama already separated out.
@@ -656,7 +658,13 @@ func (s *ollamaStreamState) handleChunk(resp ollamaapi.ChatResponse) error {
 	if resp.Done {
 		s.doneReason = resp.DoneReason
 		s.promptTokens = resp.PromptEvalCount
+		if s.promptTokens == 0 && resp.Metrics.PromptEvalCount != 0 {
+			s.promptTokens = resp.Metrics.PromptEvalCount
+		}
 		s.evalTokens = resp.EvalCount
+		if s.evalTokens == 0 && resp.Metrics.EvalCount != 0 {
+			s.evalTokens = resp.Metrics.EvalCount
+		}
 	}
 
 	return nil
@@ -708,7 +716,7 @@ func (s *ollamaStreamState) finalResponse() *model.LLMResponse {
 	}
 }
 
-func ollamaRunStreaming(ctx context.Context, client *ollamaapi.Client, chatReq *ollamaapi.ChatRequest, yield func(*model.LLMResponse, error) bool) {
+func ollamaRunStreaming(ctx context.Context, client *ollamaClient, chatReq *ollamaChatRequest, yield func(*model.LLMResponse, error) bool) {
 	state := &ollamaStreamState{yield: yield}
 
 	if err := client.Chat(ctx, chatReq, state.handleChunk); err != nil {
@@ -723,10 +731,10 @@ func ollamaRunStreaming(ctx context.Context, client *ollamaapi.Client, chatReq *
 	_ = yield(state.finalResponse(), nil)
 }
 
-func ollamaRunNonStreaming(ctx context.Context, client *ollamaapi.Client, chatReq *ollamaapi.ChatRequest, yield func(*model.LLMResponse, error) bool) {
-	var finalResp ollamaapi.ChatResponse
+func ollamaRunNonStreaming(ctx context.Context, client *ollamaClient, chatReq *ollamaChatRequest, yield func(*model.LLMResponse, error) bool) {
+	var finalResp ollamaChatResponse
 
-	err := client.Chat(ctx, chatReq, func(resp ollamaapi.ChatResponse) error {
+	err := client.Chat(ctx, chatReq, func(resp ollamaChatResponse) error {
 		finalResp = resp
 		return nil
 	})
@@ -765,11 +773,19 @@ func ollamaRunNonStreaming(ctx context.Context, client *ollamaapi.Client, chatRe
 		parts = append(parts, p)
 	}
 
+	promptTokens := finalResp.PromptEvalCount
+	if promptTokens == 0 {
+		promptTokens = finalResp.Metrics.PromptEvalCount
+	}
+	evalTokens := finalResp.EvalCount
+	if evalTokens == 0 {
+		evalTokens = finalResp.Metrics.EvalCount
+	}
 	var usage *genai.GenerateContentResponseUsageMetadata
-	if finalResp.PromptEvalCount > 0 || finalResp.EvalCount > 0 {
+	if promptTokens > 0 || evalTokens > 0 {
 		usage = &genai.GenerateContentResponseUsageMetadata{
-			PromptTokenCount:     int32(finalResp.PromptEvalCount),
-			CandidatesTokenCount: int32(finalResp.EvalCount),
+			PromptTokenCount:     int32(promptTokens),
+			CandidatesTokenCount: int32(evalTokens),
 		}
 	}
 
@@ -795,7 +811,10 @@ func OllamaListModels(ctx context.Context, baseURL string) ([]ModelInfo, error) 
 	if err != nil {
 		return nil, fmt.Errorf("invalid URL: %w", err)
 	}
-	client := ollamaapi.NewClient(u, &http.Client{Timeout: 10 * time.Second})
+	client := &ollamaClient{
+		baseURL:    u,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+	}
 	resp, err := client.List(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("listing models: %w", err)
@@ -818,13 +837,13 @@ func OllamaListModels(ctx context.Context, baseURL string) ([]ModelInfo, error) 
 
 // ollamaCapabilities maps the daemon's capability flags to the strings the
 // model table shows. Unknown flags are dropped rather than guessed at.
-func ollamaCapabilities(caps []ollamamodel.Capability) []string {
-	names := map[ollamamodel.Capability]string{
-		ollamamodel.CapabilityCompletion: "completion",
-		ollamamodel.CapabilityTools:      "tools",
-		ollamamodel.CapabilityThinking:   "thinking",
-		ollamamodel.CapabilityVision:     "vision",
-		ollamamodel.CapabilityEmbedding:  "embedding",
+func ollamaCapabilities(caps []string) []string {
+	names := map[string]string{
+		"completion": "completion",
+		"tools":      "tools",
+		"thinking":   "thinking",
+		"vision":     "vision",
+		"embedding":  "embedding",
 	}
 	out := make([]string, 0, len(caps))
 	for _, c := range caps {
@@ -847,8 +866,11 @@ func OllamaContextWindowSize(ctx context.Context, baseURL, modelName string) int
 	if err != nil {
 		return 0
 	}
-	client := ollamaapi.NewClient(u, &http.Client{Timeout: 10 * time.Second})
-	resp, err := client.Show(ctx, &ollamaapi.ShowRequest{Model: modelName})
+	client := &ollamaClient{
+		baseURL:    u,
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+	}
+	resp, err := client.Show(ctx, &ollamaShowRequest{Model: modelName})
 	if err != nil {
 		return 0
 	}
@@ -860,6 +882,303 @@ func OllamaContextWindowSize(ctx context.Context, baseURL, modelName string) int
 
 	// Fall back to the model's native context length from ModelInfo.
 	return ollamaNativeContextLength(resp.ModelInfo)
+}
+
+// ollamaClient is a lightweight HTTP client for the Ollama daemon.
+type ollamaClient struct {
+	baseURL    *url.URL
+	httpClient *http.Client
+}
+
+func (c *ollamaClient) Chat(ctx context.Context, req *ollamaChatRequest, onChunk func(ollamaChatResponse) error) error {
+	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/chat"})
+	body, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("marshaling ollama chat request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("creating ollama request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "application/x-ndjson, application/json")
+
+	httpResp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(httpResp.Body)
+		var errResp struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(respBody, &errResp) == nil && errResp.Error != "" {
+			return errors.New(errResp.Error)
+		}
+		return fmt.Errorf("status %d: %s", httpResp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	reader := bufio.NewReader(httpResp.Body)
+	for {
+		line, readErr := reader.ReadBytes('\n')
+		line = bytes.TrimSpace(line)
+		if len(line) > 0 {
+			var chunk ollamaChatResponse
+			if unmarshalErr := json.Unmarshal(line, &chunk); unmarshalErr != nil {
+				return fmt.Errorf("decoding ollama response: %w", unmarshalErr)
+			}
+			if chunkErr := onChunk(chunk); chunkErr != nil {
+				return chunkErr
+			}
+			if chunk.Done {
+				break
+			}
+		}
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return readErr
+		}
+	}
+	return nil
+}
+
+func (c *ollamaClient) List(ctx context.Context) (*ollamaListResponse, error) {
+	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/tags"})
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating ollama list request: %w", err)
+	}
+
+	httpResp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(httpResp.Body)
+		return nil, fmt.Errorf("status %d: %s", httpResp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	var listResp ollamaListResponse
+	if err := json.NewDecoder(httpResp.Body).Decode(&listResp); err != nil {
+		return nil, fmt.Errorf("decoding ollama list response: %w", err)
+	}
+	return &listResp, nil
+}
+
+func (c *ollamaClient) Show(ctx context.Context, req *ollamaShowRequest) (*ollamaShowResponse, error) {
+	u := c.baseURL.ResolveReference(&url.URL{Path: "/api/show"})
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling ollama show request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("creating ollama show request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	httpResp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer httpResp.Body.Close()
+
+	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(httpResp.Body)
+		return nil, fmt.Errorf("status %d: %s", httpResp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+
+	var showResp ollamaShowResponse
+	if err := json.NewDecoder(httpResp.Body).Decode(&showResp); err != nil {
+		return nil, fmt.Errorf("decoding ollama show response: %w", err)
+	}
+	return &showResp, nil
+}
+
+// Ollama API types for chat, show, and list.
+type ollamaChatRequest struct {
+	Model    string              `json:"model"`
+	Messages []ollamaChatMessage `json:"messages"`
+	Options  map[string]any      `json:"options"`
+	Stream   *bool               `json:"stream,omitempty"`
+	Think    *ollamaThink        `json:"think,omitempty"`
+	Tools    ollamaTools         `json:"tools,omitempty"`
+}
+
+type ollamaChatMessage struct {
+	Role       string           `json:"role"`
+	Content    string           `json:"content"`
+	Thinking   string           `json:"thinking,omitempty"`
+	ToolCalls  []ollamaToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+}
+
+type ollamaToolCall struct {
+	ID       string                 `json:"id,omitempty"`
+	Function ollamaToolCallFunction `json:"function"`
+}
+
+type ollamaToolCallFunction struct {
+	Index     int                 `json:"index"`
+	Name      string              `json:"name"`
+	Arguments ollamaToolArguments `json:"arguments"`
+}
+
+type ollamaToolArguments map[string]any
+
+func (a *ollamaToolArguments) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 || string(b) == "null" {
+		*a = make(map[string]any)
+		return nil
+	}
+	if b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(s), &m); err != nil {
+			*a = make(map[string]any)
+			return nil
+		}
+		*a = m
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		return err
+	}
+	*a = m
+	return nil
+}
+
+func (a ollamaToolArguments) ToMap() map[string]any {
+	if a == nil {
+		return make(map[string]any)
+	}
+	return map[string]any(a)
+}
+
+func (a ollamaToolArguments) Set(key string, val any) {
+	a[key] = val
+}
+
+type ollamaThink struct {
+	Value any
+}
+
+func (t ollamaThink) MarshalJSON() ([]byte, error) {
+	return json.Marshal(t.Value)
+}
+
+func (t *ollamaThink) UnmarshalJSON(b []byte) error {
+	return json.Unmarshal(b, &t.Value)
+}
+
+type ollamaTools []ollamaTool
+
+type ollamaTool struct {
+	Type     string             `json:"type"`
+	Function ollamaToolFunction `json:"function"`
+}
+
+type ollamaToolFunction struct {
+	Name        string                       `json:"name"`
+	Description string                       `json:"description,omitempty"`
+	Parameters  ollamaToolFunctionParameters `json:"parameters"`
+}
+
+type ollamaToolFunctionParameters struct {
+	Type       string               `json:"type"`
+	Properties ollamaToolProperties `json:"properties"`
+	Required   []string             `json:"required,omitempty"`
+}
+
+type ollamaToolProperties map[string]ollamaToolProperty
+
+func newToolPropertiesMap() ollamaToolProperties {
+	return make(ollamaToolProperties)
+}
+
+func (p ollamaToolProperties) Set(name string, prop ollamaToolProperty) {
+	p[name] = prop
+}
+
+func (p ollamaToolProperties) Get(name string) (ollamaToolProperty, bool) {
+	prop, ok := p[name]
+	return prop, ok
+}
+
+type ollamaToolProperty struct {
+	Type        ollamaPropertyType `json:"type,omitempty"`
+	Description string             `json:"description,omitempty"`
+	Enum        []any              `json:"enum,omitempty"`
+}
+
+type ollamaPropertyType []string
+
+func (t ollamaPropertyType) String() string {
+	if len(t) == 0 {
+		return ""
+	}
+	return t[0]
+}
+
+func (t ollamaPropertyType) MarshalJSON() ([]byte, error) {
+	if len(t) == 1 {
+		return json.Marshal(t[0])
+	}
+	return json.Marshal([]string(t))
+}
+
+type ollamaMetrics struct {
+	PromptEvalCount int `json:"prompt_eval_count"`
+	EvalCount       int `json:"eval_count"`
+}
+
+type ollamaChatResponse struct {
+	Metrics         ollamaMetrics     `json:"metrics,omitempty"`
+	PromptEvalCount int               `json:"prompt_eval_count"`
+	EvalCount       int               `json:"eval_count"`
+	Model           string            `json:"model"`
+	CreatedAt       time.Time         `json:"created_at"`
+	Message         ollamaChatMessage `json:"message"`
+	Done            bool              `json:"done"`
+	DoneReason      string            `json:"done_reason"`
+}
+
+type ollamaListResponse struct {
+	Models []ollamaModelItem `json:"models"`
+}
+
+type ollamaModelItem struct {
+	Name         string             `json:"name"`
+	Model        string             `json:"model"`
+	Details      ollamaModelDetails `json:"details"`
+	RemoteModel  string             `json:"remote_model"`
+	Capabilities []string           `json:"capabilities"`
+}
+
+type ollamaModelDetails struct {
+	ParameterSize string `json:"parameter_size"`
+	ContextLength int    `json:"context_length"`
+}
+
+type ollamaShowRequest struct {
+	Model string `json:"model"`
+}
+
+type ollamaShowResponse struct {
+	Parameters string         `json:"parameters"`
+	ModelInfo  map[string]any `json:"model_info"`
 }
 
 // ollamaNumCtxParameter reads num_ctx out of a /api/show parameters block, which

@@ -28,7 +28,6 @@ require (
 	github.com/modelcontextprotocol/go-sdk v1.7.0
 	github.com/muesli/reflow v0.3.0
 	github.com/muesli/termenv v0.16.0
-	github.com/ollama/ollama v0.33.3
 	github.com/openai/openai-go/v3 v3.56.0
 	github.com/sigstore/sigstore-go v1.3.0
 	github.com/spf13/cobra v1.10.2
@@ -157,7 +156,6 @@ require (
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/transparency-dev/formats v0.1.1 // indirect
 	github.com/transparency-dev/merkle v0.0.2 // indirect
-	github.com/wk8/go-ordered-map/v2 v2.1.8 // indirect
 	github.com/xo/terminfo v1.0.0 // indirect
 	github.com/yalue/onnxruntime_go v1.35.0 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
@@ -188,12 +186,3 @@ require (
 )
 
 replace github.com/coder/acp-go-sdk => ./third_party/acp-go-sdk
-
-// wk8/go-ordered-map/v2 pulls in github.com/mailru/easyjson (a VK-affiliated
-// library flagged as a supply-chain risk; see lima-vm/lima#3527). The vendored
-// copy under third_party/go-ordered-map is the pb33f/ordered-map fork (which
-// drops the easyjson import) keeping the original module path, so the replace
-// works without a module-path collision. Remove this replace when
-// ollama/ollama switches its internal/orderedmap wrapper to the fork (or drops
-// the dependency).
-replace github.com/wk8/go-ordered-map/v2 => ./third_party/go-ordered-map

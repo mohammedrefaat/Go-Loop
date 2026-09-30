@@ -111,6 +111,8 @@ type Config struct {
 	// The resulting log contains the entire conversation, system prompt and
 	// tool output in cleartext. Credentials are masked; nothing else is.
 	TraceHTTP      bool           `json:"traceHTTP,omitempty"`
+	// NoMouse disables mouse capture in the TUI, allowing native terminal selection and copy.
+	NoMouse        bool           `json:"noMouse,omitempty"`
 	Tools          map[string]any `json:"tools,omitempty"`
 	MCP            *MCPConfig     `json:"mcp,omitempty"`
 	Hooks          []HookConfig   `json:"hooks,omitempty"`
