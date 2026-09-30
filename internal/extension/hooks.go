@@ -3,12 +3,9 @@
 package extension
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,35 +20,39 @@ import (
 	"google.golang.org/adk/v2/tool"
 
 	"github.com/dimetron/pi-go/internal/otel"
-	"github.com/dimetron/pi-go/internal/procs"
 )
 
-// HookConfig defines a shell command hook that runs before or after tool calls.
+// HookConfig defines a shell command hook that runs at a named point in the
+// agent's lifecycle.
 type HookConfig struct {
-	// Event is "before_tool" or "after_tool".
+	// Event names the moment to fire at. Both the current names (PreToolUse,
+	// PostToolUse, …) and the legacy before_tool/after_tool spellings are
+	// accepted; see ParseEvent.
 	Event string `json:"event"`
 	// Command is the shell command to execute.
 	Command string `json:"command"`
 	// Tools optionally restricts this hook to specific tool names.
 	// If empty, the hook fires for all tools.
 	Tools []string `json:"tools,omitempty"`
+	// Matcher is a regular expression matched against the tool name, for the
+	// cases a name list cannot express ("mcp__*", ".*_write$"). A pattern that
+	// is not a valid regex is treated as a glob, so `mcp__*` means the prefix
+	// rather than a config error.
+	Matcher string `json:"matcher,omitempty"`
 	// Timeout in seconds for hook execution. Default: 10.
 	Timeout int `json:"timeout,omitempty"`
 }
 
 // matchesTool returns true if the hook should fire for the given tool name.
 func (h HookConfig) matchesTool(name string) bool {
-	if len(h.Tools) == 0 {
-		return true
-	}
-	return slices.Contains(h.Tools, name)
+	return matcherFrom(h.Tools, h.Matcher).matches(name)
 }
 
 func (h HookConfig) timeout() time.Duration {
 	if h.Timeout > 0 {
 		return time.Duration(h.Timeout) * time.Second
 	}
-	return 10 * time.Second
+	return DefaultHookTimeout
 }
 
 // ToolCallReporter is the interface that adapter.Stream exposes for reporting
@@ -112,12 +113,12 @@ func BuildToolCallCallbacks(s ToolCallReporter) ([]llmagent.BeforeToolCallback, 
 // were dirtied, so the damage persists until a full redraw. It installs a sink
 // pointing at the session log file instead. Same late-binding idiom as
 // auth.SetDebugLogger.
-var hookLog atomic.Pointer[func(string)]
+var hookLog atomic.Pointer[func(string, ...any)]
 
 // SetHookLogger installs a sink for hook-failure diagnostics. Passing nil
 // restores the default (standard logger, i.e. stderr). Hooks run from callback
 // goroutines, so implementations must be goroutine-safe.
-func SetHookLogger(fn func(string)) {
+func SetHookLogger(fn func(string, ...any)) {
 	if fn == nil {
 		hookLog.Store(nil)
 		return
@@ -136,12 +137,17 @@ func hookLogf(format string, args ...any) {
 	log.Print(msg)
 }
 
-// BuildBeforeToolCallbacks converts HookConfigs with event "before_tool" into
+// BuildBeforeToolCallbacks converts HookConfigs with event PreToolUse into
 // ADK BeforeToolCallback functions.
+//
+// These callbacks are observational. The blocking PreToolUse path is
+// HookGuard, which runs at the permission seam; this callback exists so a
+// PreToolUse hook still fires on surfaces that have no permission engine —
+// ACP with auto-approval, a subagent — rather than silently never firing.
 func BuildBeforeToolCallbacks(hooks []HookConfig) []llmagent.BeforeToolCallback {
 	var cbs []llmagent.BeforeToolCallback
 	for _, h := range hooks {
-		if h.Event != "before_tool" {
+		if parsed, err := ParseEvent(h.Event); err != nil || parsed != EventPreToolUse {
 			continue
 		}
 		hook := h // capture
@@ -159,20 +165,40 @@ func BuildBeforeToolCallbacks(hooks []HookConfig) []llmagent.BeforeToolCallback 
 	return cbs
 }
 
-// BuildAfterToolCallbacks converts HookConfigs with event "after_tool" into
+// BuildAfterToolCallbacks converts HookConfigs with event PostToolUse into
 // ADK AfterToolCallback functions.
+//
+// A failed tool fires PostToolUseFailure instead. They are separate events
+// because ADK routes both successes and failures through the same callback, so
+// the two can only be told apart by inspecting the result payload — which is
+// exactly the coupling the separate event names exist to remove.
 func BuildAfterToolCallbacks(hooks []HookConfig) []llmagent.AfterToolCallback {
 	var cbs []llmagent.AfterToolCallback
 	for _, h := range hooks {
-		if h.Event != "after_tool" {
+		parsed, err := ParseEvent(h.Event)
+		if err != nil || (parsed != EventPostToolUse && parsed != EventPostToolUseFailure) {
 			continue
 		}
 		hook := h // capture
+		event := parsed
 		cbs = append(cbs, func(ctx agent.Context, t tool.Tool, args, result map[string]any, err error) (map[string]any, error) {
 			if !hook.matchesTool(t.Name()) {
 				return result, nil
 			}
-			if hookErr := runHookCommand(ctx, hook, t.Name(), result); hookErr != nil {
+			// Route to the failure event when the call did not succeed, so a
+			// hook registered for PostToolUseFailure sees only failures.
+			fired := event
+			if err != nil {
+				fired = EventPostToolUseFailure
+			} else if event == EventPostToolUseFailure {
+				// Registered for failures, but this call succeeded.
+				return result, nil
+			}
+			data := map[string]any{"result": result}
+			if err != nil {
+				data["error"] = err.Error()
+			}
+			if _, hookErr := runHook(ctx, hook, withEvent(data, fired, t.Name())); hookErr != nil {
 				hookLogf("hook %q failed for tool %q: %v", hook.Command, t.Name(), hookErr)
 			}
 			return result, nil
@@ -398,57 +424,30 @@ func genAIProviderAttr(providerName string) attribute.KeyValue {
 }
 
 // RunLifecycleHook executes a lifecycle hook's shell command with the event
-// name and data as JSON on stdin. Lifecycle hooks (turn_complete,
-// user_input_required) have no tool, so the payload carries the event instead.
-// A non-zero exit or timeout is logged by the caller, never fatal.
+// name and data as JSON on stdin. Lifecycle hooks have no tool, so the payload
+// carries the event instead. A non-zero exit or timeout is logged by the
+// caller, never fatal.
 func RunLifecycleHook(ctx context.Context, hook HookConfig, event string, data map[string]any) error {
-	hookCtx, cancel := context.WithTimeout(ctx, hook.timeout())
-	defer cancel()
-
-	cmd := procs.CommandContext(hookCtx, "sh", "-c", hook.Command)
-
-	input := map[string]any{
+	_, err := runHook(ctx, hook, map[string]any{
 		"event": event,
 		"data":  data,
-	}
-	jsonBytes, err := json.Marshal(input)
-	if err != nil {
-		return fmt.Errorf("marshaling hook input: %w", err)
-	}
-	cmd.Stdin = bytes.NewReader(jsonBytes)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("command %q: %w (stderr: %s)", hook.Command, err, stderr.String())
-	}
-	return nil
+	})
+	return err
 }
 
-// runHookCommand executes a hook's shell command with the tool name and data as JSON on stdin.
+// runHookCommand executes a hook's shell command with the tool name and data as
+// JSON on stdin, discarding the verdict.
+//
+// It exists for the before/after-tool callbacks that predate the decision
+// protocol: they run hooks for their side effects and deliberately ignore what
+// the hook said, because only PreToolUse has a decision that reaches the
+// permission seam. Routing them through runHook rather than a second copy of
+// the shell and stdin handling means a hook behaves identically on both paths —
+// including the PowerShell fallback, which only the shared path has.
 func runHookCommand(ctx context.Context, hook HookConfig, toolName string, data map[string]any) error {
-	hookCtx, cancel := context.WithTimeout(ctx, hook.timeout())
-	defer cancel()
-
-	cmd := procs.CommandContext(hookCtx, "sh", "-c", hook.Command)
-
-	// Pass context as JSON on stdin.
-	input := map[string]any{
+	_, err := runHook(ctx, hook, map[string]any{
 		"tool": toolName,
 		"data": data,
-	}
-	jsonBytes, err := json.Marshal(input)
-	if err != nil {
-		return fmt.Errorf("marshaling hook input: %w", err)
-	}
-	cmd.Stdin = bytes.NewReader(jsonBytes)
-
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("command %q: %w (stderr: %s)", hook.Command, err, stderr.String())
-	}
-	return nil
+	})
+	return err
 }

@@ -795,7 +795,7 @@ func TestDeferredInitCoreTools(t *testing.T) {
 	root := t.TempDir()
 	var res initResources
 
-	coreTools, err := deferredInitCoreTools(root, "", &res)
+	coreTools, err := deferredInitCoreTools(root, "", config.Config{}, &res)
 	if err != nil {
 		t.Fatalf("deferredInitCoreTools: %v", err)
 	}

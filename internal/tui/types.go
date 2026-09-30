@@ -43,6 +43,13 @@ type Config struct {
 	// chat — auto-compaction outcomes, for instance. Compaction discards
 	// history, so it must never happen silently.
 	SystemNoticeCh <-chan string
+	// PermissionBridge carries the tool-permission engine to the UI. The tools
+	// are built before the model exists, so this is what lets the approval
+	// prompt be attached late without the tool layer losing its policy. It is
+	// an interface because the engine may not exist yet when the TUI starts —
+	// a *PendingBridge stands in until it does. Nil leaves permissions
+	// unconfigured, which is the pre-permission behaviour.
+	PermissionBridge PermissionApprover
 	// ContextBreakdown attributes fixed context overhead (system prompt, tool
 	// definitions, rules, skills, MCP tools, subagents) to its origins, so the
 	// gauge can show what is filling the window rather than only how much.

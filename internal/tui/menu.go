@@ -275,11 +275,21 @@ func (m *model) overlayModelPicker(messages string, mainWidth int) string {
 	if picker == "" {
 		return messages
 	}
+	return overlayCenteredBox(messages, picker, mainWidth)
+}
+
+// overlayCenteredBox paints box over messages, centered horizontally and
+// vertically. Both interactive pickers use it, so a session list and a model
+// list sit in the same place and look the same; only the box differs.
+func overlayCenteredBox(messages, box string, mainWidth int) string {
+	if box == "" {
+		return messages
+	}
 
 	lines := strings.Split(messages, "\n")
 	viewportHeight := len(lines)
 
-	pickerLines := strings.Split(picker, "\n")
+	pickerLines := strings.Split(box, "\n")
 	if viewportHeight > 0 && len(pickerLines) > viewportHeight {
 		pickerLines = pickerLines[:viewportHeight]
 	}

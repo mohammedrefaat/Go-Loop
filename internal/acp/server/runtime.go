@@ -28,6 +28,7 @@ import (
 	"github.com/dimetron/pi-go/internal/guardrail"
 	"github.com/dimetron/pi-go/internal/lsp"
 	"github.com/dimetron/pi-go/internal/otel"
+	"github.com/dimetron/pi-go/internal/permission"
 	"github.com/dimetron/pi-go/internal/provider"
 	pisession "github.com/dimetron/pi-go/internal/session"
 	"github.com/dimetron/pi-go/internal/subagent"
@@ -444,7 +445,31 @@ func buildSessionResources(rt RuntimeConfig, cfg config.Config, turn PromptTurn,
 	}
 
 	bashSup := tools.NewBashSupervisor()
-	coreTools, err := tools.CoreTools(sandbox, tools.WithBashSupervisor(bashSup))
+	permEngine, permRes := permission.FromConfig(cfg.Permissions,
+		permission.WithNonInteractive(permission.Deny))
+	// A rule that did not parse is a rule the user believes is protecting them
+	// and is not, so it is reported. It stays non-fatal — the valid rules still
+	// load, and a typo in one line should not stop the session. ACP's channel
+	// back to the editor is a structured one, and inventing a shape for a
+	// warning is not worth it here: the session log is where this belongs, and
+	// the interactive surface reports the same condition to the user directly.
+	if msg := permRes.DescribeErrors(); msg != "" {
+		slog.Warn("permission rules ignored", "detail", msg)
+	}
+	coreTools, err := tools.CoreTools(sandbox,
+		tools.WithBashSupervisor(bashSup),
+		// ACP is driven by an editor, not a person at a terminal, so there is
+		// nobody to answer a permission question: an `ask` rule is a refusal.
+		//
+		// The hook layer wraps the engine rather than replacing it, so a
+		// PreToolUse hook can still deny or clear a call, and a hook asking for
+		// confirmation resolves through the engine's headless policy instead of
+		// hanging on a prompt nobody is there to answer.
+		tools.WithGuard(tools.HookGuard{
+			Hooks: extension.NewHookRunner(convertHooks(cfg.Hooks)),
+			Next:  tools.EngineGuard{Engine: permEngine},
+		}),
+	)
 	if err != nil {
 		_ = sandbox.Close()
 		return nil, fmt.Errorf("creating core tools: %w", err)
@@ -596,6 +621,7 @@ func convertHooks(cfgHooks []config.HookConfig) []extension.HookConfig {
 			Event:   h.Event,
 			Command: h.Command,
 			Tools:   h.Tools,
+			Matcher: h.Matcher,
 			Timeout: h.Timeout,
 		}
 	}
