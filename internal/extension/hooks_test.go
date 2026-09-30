@@ -735,7 +735,7 @@ func TestBuildBeforeToolCallbacks_Invoke(t *testing.T) {
 	dir := filepath.ToSlash(t.TempDir())
 	ran := dir + "/ran"
 	var logged []string
-	SetHookLogger(func(msg string) { logged = append(logged, msg) })
+	SetHookLogger(func(msg string, _ ...any) { logged = append(logged, msg) })
 	t.Cleanup(func() { SetHookLogger(nil) })
 
 	cbs := BuildBeforeToolCallbacks([]HookConfig{
@@ -787,7 +787,7 @@ func TestBuildAfterToolCallbacks_Invoke(t *testing.T) {
 	dir := filepath.ToSlash(t.TempDir())
 	payload := dir + "/payload.json"
 	var logged []string
-	SetHookLogger(func(msg string) { logged = append(logged, msg) })
+	SetHookLogger(func(msg string, _ ...any) { logged = append(logged, msg) })
 	t.Cleanup(func() { SetHookLogger(nil) })
 
 	cbs := BuildAfterToolCallbacks([]HookConfig{
@@ -851,7 +851,7 @@ func TestSetHookLogger_NilRestoresDefault(t *testing.T) {
 		log.SetFlags(origFlags)
 	})
 
-	SetHookLogger(func(string) { t.Error("sink called after being cleared") })
+	SetHookLogger(func(string, ...any) { t.Error("sink called after being cleared") })
 	SetHookLogger(nil)
 	hookLogf("boom %d", 7)
 

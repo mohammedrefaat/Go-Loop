@@ -20,7 +20,11 @@ type HookConfig struct {
 	Event   string   `json:"event"`
 	Command string   `json:"command"`
 	Tools   []string `json:"tools,omitempty"`
-	Timeout int      `json:"timeout,omitempty"`
+	// Matcher restricts the hook by pattern rather than by name, for the cases
+	// a list cannot express ("mcp__*", ".*_write$"). An invalid regex is
+	// treated as a glob, so a pattern never turns into a config error.
+	Matcher string `json:"matcher,omitempty"`
+	Timeout int    `json:"timeout,omitempty"`
 }
 
 // RoleConfig maps a role to a specific model and optional provider override.
@@ -134,6 +138,32 @@ type Config struct {
 	// into the global config file by an unrelated operation such as
 	// SaveDefaultRole. Read both together with LLMSSources.
 	InferredLLMS []LLMSSource `json:"-"`
+
+	// Permissions configures the tool-permission layer. Pointer, like the
+	// other optional sections, so "the user never mentioned permissions"
+	// is distinguishable from "the user asked for the zero value" — the
+	// former must leave the agent auto-approving, which is pi-go's default
+	// behaviour and must not change just because this section was added.
+	Permissions *PermissionConfig `json:"permissions,omitempty"`
+}
+
+// PermissionConfig holds the user's tool-permission rules and starting mode.
+type PermissionConfig struct {
+	// Mode is the starting permission mode: default, acceptEdits, plan,
+	// auto, dontAsk, or bypassPermissions. Empty means auto, so an existing
+	// config file with no permissions section behaves exactly as it did
+	// before the permission layer existed.
+	Mode string `json:"mode,omitempty"`
+
+	// Rules are the permission rules in config syntax, e.g.
+	// "deny Bash(rm *)" or "Read(.env)". They are evaluated deny → ask →
+	// allow, and the first match in that order wins regardless of
+	// specificity — see internal/permission for why.
+	//
+	// Kept as raw strings rather than a parsed type so a malformed rule is
+	// reported by name at load time instead of failing the whole config
+	// unmarshal, and so the original text is preserved for /doctor.
+	Rules []string `json:"rules,omitempty"`
 }
 
 // PalaceConfig holds settings for the MemPalace memory system.

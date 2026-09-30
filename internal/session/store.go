@@ -769,6 +769,15 @@ func (s *FileService) GetSessionTitle(sessionID string) (string, error) {
 	return sess.meta.Title, nil
 }
 
+// SessionDir returns the directory holding a session's meta.json and
+// events.jsonl. It is where exports and checkpoints belong, so callers that
+// need to write alongside a session should not have to re-derive the
+// baseDir/sessionID layout themselves. The directory is returned whether or
+// not it exists; callers that write into it are responsible for MkdirAll.
+func (s *FileService) SessionDir(sessionID string) string {
+	return filepath.Join(s.baseDir, sessionID)
+}
+
 // UpdatePlanContext updates the plan session context in the session metadata.
 // Pass nil to clear the context.
 func (s *FileService) UpdatePlanContext(sessionID string, ctx *PlanContext) error {

@@ -25,6 +25,7 @@ import (
 	"github.com/dimetron/pi-go/internal/lsp"
 	"github.com/dimetron/pi-go/internal/memory"
 	"github.com/dimetron/pi-go/internal/notice"
+	"github.com/dimetron/pi-go/internal/permission"
 	"github.com/dimetron/pi-go/internal/provider"
 	pisession "github.com/dimetron/pi-go/internal/session"
 	"github.com/dimetron/pi-go/internal/subagent"
@@ -42,6 +43,12 @@ type initResources struct {
 	sessionLog *logger.Logger
 	sessionID  string // captured for resume hint on exit
 	bashSup    *tools.BashSupervisor
+	// permBridge carries the permission engine to the TUI, which attaches the
+	// approval prompt once a model exists.
+	permBridge *tui.PermissionBridge
+	// noticeCh is where startup messages go. Held on the struct because it is
+	// created by the caller, before the goroutine that builds the tools.
+	noticeCh chan string
 }
 
 func (r *initResources) cleanup() {
@@ -124,7 +131,14 @@ func runInteractive(
 	defer extension.SetInteractiveOAuth(false)
 
 	var res initResources
+	res.noticeCh = noticeCh
 	initDone := make(chan struct{})
+	// The permission engine is built by the init goroutine and the TUI needs it
+	// on the very next line, so the two are ordered explicitly. Reading res
+	// directly would be a race: the goroutine writes permBridge, this
+	// goroutine reads it, and nothing between them establishes a happens-before
+	// edge. A buffered channel of size one carries that edge and nothing else.
+	permReady := make(chan *tui.PermissionBridge, 1)
 
 	// Create a child context so deferred init is canceled when the TUI exits.
 	initCtx, initCancel := context.WithCancel(ctx)
@@ -132,8 +146,15 @@ func runInteractive(
 	go func() {
 		defer close(initDone)
 		defer close(initCh)
-		deferredInit(initCtx, cfg, llm, info.Provider, info.BaseURL, tokenTracker, cwd, sandboxRoot, worktreeDir, initCh, noticeCh, &res)
+		deferredInit(initCtx, cfg, llm, info.Provider, info.BaseURL, tokenTracker, cwd, sandboxRoot, worktreeDir, initCh, noticeCh, &res, permReady)
 	}()
+
+	// Waiting here would stall the UI behind a slow sandbox or an MCP
+	// handshake, which is exactly the startup screen this goroutine exists to
+	// make bearable. Instead Run receives a waiting handle: the TUI attaches its
+	// approver to it whenever the engine turns up, and tool calls that ask in
+	// the meantime are refused rather than answered by nobody.
+	pendingBridge := tui.NewPendingPermissionBridge(permReady)
 
 	tuiErr := tui.Run(ctx, tui.Config{
 		LLM:            llm,
@@ -149,6 +170,9 @@ func runInteractive(
 		LifecycleHooks: convertHooks(cfg.Hooks),
 		DeferredInit:   initCh,
 		SystemNoticeCh: noticeCh,
+		// The bridge is still waiting for the engine at this point; the TUI
+		// attaches its approver as soon as deferred init produces it.
+		PermissionBridge: pendingBridge,
 		ModelSwitcher: func(switchCtx context.Context, modelName string) (adkmodel.LLM, string, string, error) {
 			return buildSwitchedLLM(switchCtx, cfg, tokenTracker, modelName)
 		},
@@ -180,6 +204,7 @@ func deferredInit(
 	ch chan<- tui.InitEvent,
 	noticeCh chan string,
 	res *initResources,
+	permReady chan<- *tui.PermissionBridge,
 ) {
 	initTotal := deferredInitTotal(cfg)
 	send := func(item string, done bool) {
@@ -192,7 +217,7 @@ func deferredInit(
 	// --- Phase 1: Core tools (fast, needed by everything) ---
 	send("tools", false)
 
-	coreTools, err := deferredInitCoreTools(sandboxRoot, worktreeDir, res)
+	coreTools, err := deferredInitCoreTools(sandboxRoot, worktreeDir, cfg, res)
 	if err != nil {
 		fail(err)
 		return
@@ -200,6 +225,13 @@ func deferredInit(
 	sandbox, bashSup := res.sandbox, res.bashSup
 
 	send("tools", true)
+	// Publish the bridge now that it exists. The TUI is already up and waiting
+	// on it; the send is non-blocking in practice because the channel is
+	// buffered, but a select keeps a bug here from stalling init forever.
+	select {
+	case permReady <- res.permBridge:
+	default:
+	}
 
 	// --- Phase 2: Parallel subsystems ---
 	ps := runDeferredInitPhase2(ctx, cfg, cwd, send)
@@ -393,7 +425,12 @@ func deferredInit(
 // deferredInitCoreTools builds the sandbox, the bash supervisor and the core
 // tool set. Both the sandbox and the supervisor are recorded on res as soon as
 // they exist, so a later failure here still leaves them for cleanup to close.
-func deferredInitCoreTools(sandboxRoot, worktreeDir string, res *initResources) ([]adktool.Tool, error) {
+//
+// The permission engine is built here and stored on res, because this is the
+// only point that sees both the user's config and the tool layer. The UI's
+// approver is attached later, by tui.Run — see the PermissionBridge comment for
+// why that ordering is forced and what the bridge refuses in the meantime.
+func deferredInitCoreTools(sandboxRoot, worktreeDir string, cfg config.Config, res *initResources) ([]adktool.Tool, error) {
 	sandbox, err := tools.NewSandbox(sandboxRoot, worktreeDir)
 	if err != nil {
 		return nil, fmt.Errorf("creating sandbox: %w", err)
@@ -411,7 +448,29 @@ func deferredInitCoreTools(sandboxRoot, worktreeDir string, res *initResources) 
 	bashSup := tools.NewBashSupervisor()
 	res.bashSup = bashSup
 
-	coreTools, err := tools.CoreTools(sandbox, tools.WithBashSupervisor(bashSup))
+	permEngine, permRes := permission.FromConfig(cfg.Permissions)
+	// The bridge is the approver, and it refuses until tui.Run attaches the
+	// prompt. A rule that asks before the UI exists is refused rather than
+	// answered by nobody.
+	res.permBridge = tui.NewPermissionBridge(permEngine)
+	// A rule the user wrote that failed to parse must be visible, not silently
+	// absent — otherwise they believe it is protecting something. It goes to
+	// the notice channel, never to stdout, which would corrupt the TUI.
+	if msg := permRes.DescribeErrors(); msg != "" && res.noticeCh != nil {
+		res.noticeCh <- "permission rules ignored: " + msg
+	}
+
+	coreTools, err := tools.CoreTools(sandbox,
+		tools.WithBashSupervisor(bashSup),
+		// Hooks wrap the permission engine rather than replacing it, so a
+		// PreToolUse hook can deny or clear a call, and a hook asking for
+		// confirmation reaches the user through the same bridge a rule-driven
+		// ask uses.
+		tools.WithGuard(tools.HookGuard{
+			Hooks: extension.NewHookRunner(convertHooks(cfg.Hooks)),
+			Next:  tools.EngineGuard{Engine: permEngine},
+		}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("creating core tools: %w", err)
 	}

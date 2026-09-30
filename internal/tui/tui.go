@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"charm.land/bubbles/v2/list"
@@ -147,6 +148,16 @@ type model struct {
 
 	// Model/provider picker interactive menu.
 	modelPicker *modelPickerState
+
+	// Session picker interactive menu (/resume).
+	sessionPicker *sessionPickerState
+	// permissionPrompt is the pending tool-approval question, or nil. It is
+	// written by the agent goroutine (via Approver) as well as by Update, so it
+	// is the one piece of UI state that permissionPromptMu guards. The mutex
+	// does not make the rest of the model thread-safe and is not to be used
+	// as if it did — the Update loop remains the sole owner of everything else.
+	permissionPrompt   *permissionPromptState
+	permissionPromptMu sync.Mutex
 
 	// Unified search popup for slash commands and history.
 	searchPopup *searchPopupState
@@ -547,7 +558,7 @@ func (m *model) applyTheme() {
 // wiring is testable without standing up a Bubble Tea program — notably the
 // ordering below, where building the renderer before the theme was known is
 // what pinned the whole transcript to the dark stylesheet.
-func newModel(ctx context.Context, cancel context.CancelFunc, cfg Config) model {
+func newModel(ctx context.Context, cancel context.CancelFunc, cfg Config) *model {
 	// Initialize the theme manager before the markdown renderer: the glamour
 	// stylesheet is chosen from the palette, so the renderer cannot be built
 	// until the theme is known.
@@ -565,7 +576,7 @@ func newModel(ctx context.Context, cancel context.CancelFunc, cfg Config) model 
 		history = make([]HistoryEntry, 0)
 	}
 
-	m := model{
+	m := &model{
 		cfg:          cfg,
 		ctx:          ctx,
 		cancel:       cancel,
@@ -597,6 +608,10 @@ func Run(ctx context.Context, cfg Config) error {
 	defer cancel()
 
 	m := newModel(ctx, cancel, cfg)
+	// Attach the approval prompt now that there is a model to draw it. The
+	// tools were built earlier, before any UI existed, so until this point a
+	// permission question had nowhere to be shown and was refused.
+	m.attachPermissionPrompt()
 
 	// Clear inherited terminal state before the first frame is drawn. pi renders
 	// on the normal screen, so whatever the previous command left set is still
@@ -604,7 +619,7 @@ func Run(ctx context.Context, cfg Config) error {
 	prepareTerminal()
 
 	opts := append(terminalProgramOptions(os.Stdout, os.Environ()), tea.WithContext(ctx))
-	p := tea.NewProgram(&m, opts...)
+	p := tea.NewProgram(m, opts...)
 	_, err := p.Run()
 	drainTerminalResponses()
 	if m.initErr != nil {
@@ -1144,8 +1159,15 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return model, cmd
 		}
 	}
+	if m.sessionPicker != nil {
+		if model, cmd, handled := m.handleSessionPickerKey(msg); handled {
+			return model, cmd
+		}
+	}
 
 	for _, handle := range []keyHandler{
+		m.handlePermissionPromptKey,
+		m.handleModeCycleKey,
 		m.handleCommitKey,
 		m.handleLoginKey,
 		m.handleSkillCreateKey,
@@ -1277,6 +1299,10 @@ func (m *model) handleInterruptKey(key tea.Key) (tea.Model, tea.Cmd, bool) {
 	case key.Code == tea.KeyEsc:
 		if m.modelPicker != nil {
 			m.modelPicker = nil
+			return m, nil, true
+		}
+		if m.sessionPicker != nil {
+			m.sessionPicker = nil
 			return m, nil, true
 		}
 		if m.searchPopup != nil {
@@ -1592,10 +1618,24 @@ func (m *model) View() tea.View {
 				count := strings.Count(picker, "\n") + 1
 				visibleMessages = strings.Repeat("\n ", count)
 			}
+		} else if m.sessionPicker != nil {
+			picker := m.renderSessionPicker(max(30, min(bodyWidth-4, 80)))
+			if picker != "" {
+				count := strings.Count(picker, "\n") + 1
+				visibleMessages = strings.Repeat("\n ", count)
+			}
 		} else if m.searchPopup != nil {
 			popup := m.renderSearchPopup(max(0, bodyWidth-4))
 			if popup != "" {
 				count := strings.Count(popup, "\n") + 1
+				visibleMessages = strings.Repeat("\n ", count)
+			}
+		} else if m.permissionPrompt != nil {
+			// The overlay itself is painted further down the chain; the blank
+			// block here reserves its rows so it does not reflow the layout.
+			box := m.renderPermissionPrompt(max(30, min(bodyWidth-4, 80)))
+			if box != "" {
+				count := strings.Count(box, "\n") + 1
 				visibleMessages = strings.Repeat("\n ", count)
 			}
 		}
@@ -1604,7 +1644,11 @@ func (m *model) View() tea.View {
 			messagesView, availableHeight, m.chatModel.Scroll)
 	}
 	visibleMessages = m.overlayModelPicker(visibleMessages, bodyWidth)
+	visibleMessages = m.overlaySessionPicker(visibleMessages, bodyWidth)
 	visibleMessages = m.overlaySearchPopup(visibleMessages, bodyWidth)
+	// Last, so an approval question is never painted under by another overlay:
+	// a question the user cannot see blocks the agent with no way to answer it.
+	visibleMessages = m.overlayPermissionPrompt(visibleMessages, bodyWidth)
 
 	// Note: width constraint is handled by glamour's WithWordWrap(contentWidth) in chatModel.UpdateRenderer.
 	// lipgloss.Width() counts raw bytes including invisible ANSI codes, causing wrapping issues.
@@ -2446,7 +2490,7 @@ func (m *model) handleInitEvent(msg initEventMsg) (tea.Model, tea.Cmd) {
 		// Hook failures must never reach stderr while the TUI holds the
 		// alternate screen. Installed unconditionally: with no logger the sink
 		// swallows the message, which still beats corrupting the UI.
-		extension.SetHookLogger(func(msg string) { r.Logger.Error("hook: " + msg) })
+		extension.SetHookLogger(func(msg string, _ ...any) { r.Logger.Error("hook: " + msg) })
 		m.cfg.Skills = r.Skills
 		m.cfg.SkillDirs = r.SkillDirs
 		m.cfg.GenerateCommitMsg = r.GenerateCommitMsg
@@ -2492,7 +2536,7 @@ func (m *model) handleInitEvent(msg initEventMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) shouldShowSlashCommandPopup() bool {
-	if m.running || m.loading || m.login != nil || m.commit != nil || m.pendingSkillCreate != nil || m.modelPicker != nil {
+	if m.running || m.loading || m.login != nil || m.commit != nil || m.pendingSkillCreate != nil || m.modelPicker != nil || m.sessionPicker != nil {
 		return false
 	}
 	text := m.inputModel.Text

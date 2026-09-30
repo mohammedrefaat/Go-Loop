@@ -20,6 +20,7 @@ type CoreOption func(*coreConfig)
 type coreConfig struct {
 	bashSupervisor *BashSupervisor
 	readLedger     *ReadLedger
+	guard          Guard
 }
 
 // WithBashSupervisor makes the bash tool use a caller-owned supervisor, so the
@@ -37,6 +38,17 @@ func WithBashSupervisor(sup *BashSupervisor) CoreOption {
 // for tools built by this call.
 func WithReadLedger(l *ReadLedger) CoreOption {
 	return func(c *coreConfig) { c.readLedger = l }
+}
+
+// WithGuard routes every core tool through a permission Guard. Without it the
+// tools are unguarded, which is what keeps a surface that has not opted into
+// permissions behaving exactly as it did before they existed.
+//
+// The guard wraps the finished tools rather than each builder, so it sees the
+// same coerced argument map the tool will actually receive and cannot be
+// bypassed by a tool added to the slice later.
+func WithGuard(g Guard) CoreOption {
+	return func(c *coreConfig) { c.guard = g }
 }
 
 // CoreTools returns the core coding agent tools as ADK FunctionTools.
@@ -84,7 +96,7 @@ func CoreTools(sandbox *Sandbox, opts ...CoreOption) ([]tool.Tool, error) {
 	}
 	tools = append(tools, sessionStatsTool)
 
-	return tools, nil
+	return GuardTools(tools, cfg.guard), nil
 }
 
 func inputSchema[T any](removeRequired bool) *jsonschema.Schema {

@@ -37,6 +37,7 @@ import (
 	"github.com/dimetron/pi-go/internal/memory"
 	"github.com/dimetron/pi-go/internal/otel"
 	"github.com/dimetron/pi-go/internal/palace"
+	"github.com/dimetron/pi-go/internal/permission"
 	"github.com/dimetron/pi-go/internal/pirpc"
 	"github.com/dimetron/pi-go/internal/provider"
 	"github.com/dimetron/pi-go/internal/ratelimit"
@@ -683,7 +684,32 @@ func initNonInteractiveRuntime(ctx context.Context, cfg *config.Config, cwd, san
 	// to prevent tools from exposing global process credentials or API keys.
 
 	bashSup := tools.NewBashSupervisor()
-	coreTools, err := tools.CoreTools(sandbox, tools.WithBashSupervisor(bashSup))
+	// A non-interactive run has nobody to ask, so an `ask` rule resolves to a
+	// refusal rather than a prompt. The guard is installed here too, not only
+	// in the TUI: a headless surface that skips it would have no permission
+	// enforcement at all, which is the one place silent enforcement is least
+	// acceptable.
+	permEngine, permRes := permission.FromConfig(cfg.Permissions,
+		permission.WithNonInteractive(permission.Deny))
+	// A rule that did not parse is a rule the user believes is protecting them
+	// and is not, so it is reported rather than dropped. It stays non-fatal: the
+	// valid rules still load, and a typo in one line should not stop a run.
+	// The TUI surfaces this through its notice channel; here it goes to the
+	// session log and to stderr, which is where a headless run's diagnostics go.
+	if msg := permRes.DescribeErrors(); msg != "" {
+		fmt.Fprintf(os.Stderr, "pi-go: warning: permission rules ignored: %s\n", msg)
+	}
+	coreTools, err := tools.CoreTools(sandbox,
+		tools.WithBashSupervisor(bashSup),
+		// Hooks wrap the permission engine rather than replacing it, so a
+		// PreToolUse hook can deny or clear a call on a one-shot run too — the
+		// headless run is exactly where a scripted policy is most useful,
+		// because nothing is watching to notice a call that should not happen.
+		tools.WithGuard(tools.HookGuard{
+			Hooks: extension.NewHookRunner(convertHooks(cfg.Hooks)),
+			Next:  tools.EngineGuard{Engine: permEngine},
+		}),
+	)
 	if err != nil {
 		_ = sandbox.Close()
 		return nil, fmt.Errorf("creating core tools: %w", err)
@@ -1950,6 +1976,7 @@ func convertHooks(cfgHooks []config.HookConfig) []extension.HookConfig {
 			Event:   h.Event,
 			Command: h.Command,
 			Tools:   h.Tools,
+			Matcher: h.Matcher,
 			Timeout: h.Timeout,
 		}
 	}
