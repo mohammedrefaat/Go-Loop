@@ -532,9 +532,13 @@ func (rc *responseCapture) Flush() {
 	}
 }
 
-// loggingMiddleware logs every HTTP request and highlights errors.
+// loggingMiddleware logs every HTTP request, sets standard security headers, and highlights errors.
 func (s *ServerV2) loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+
 		start := time.Now()
 		rc := &responseCapture{ResponseWriter: w, status: http.StatusOK}
 

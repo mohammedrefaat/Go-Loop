@@ -366,3 +366,27 @@ func TestHandleSubmitPairCode_LockoutRejects(t *testing.T) {
 		t.Errorf("status after lockout = %d, want 400", got)
 	}
 }
+
+// --- security headers ---
+
+func TestSecurityHeaders(t *testing.T) {
+	s := newTestServerV2(t)
+	defer s.Shutdown(t.Context())
+
+	handler := s.httpServer.Handler
+	r := httptest.NewRequest("GET", "/pair", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, r)
+
+	headers := map[string]string{
+		"X-Content-Type-Options": "nosniff",
+		"X-Frame-Options":        "DENY",
+		"X-XSS-Protection":       "1; mode=block",
+	}
+
+	for k, want := range headers {
+		if got := w.Header().Get(k); got != want {
+			t.Errorf("header %s = %q, want %q", k, got, want)
+		}
+	}
+}
