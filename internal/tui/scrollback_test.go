@@ -107,3 +107,24 @@ func TestViewRendersOnlyInProgressTurn(t *testing.T) {
 		t.Errorf("View() should NOT re-render committed first turn, got:\n%s", viewOutput)
 	}
 }
+
+func TestTurnCompletionClearsMatrixAndSelection(t *testing.T) {
+	m := newTestModelFull(t)
+	m.running = true
+	m.matrix.feed("some tokens", 80)
+	m.sel = selection{present: true, anchorX: 1, anchorY: 2, cursorX: 10, cursorY: 2}
+	m.chatModel.Messages = append(m.chatModel.Messages,
+		message{role: "user", content: "Prompt"},
+		message{role: "assistant", content: "Response"},
+	)
+
+	newM, _ := m.Update(agentDoneMsg{})
+	mm := newM.(*model)
+
+	if mm.matrix.active {
+		t.Error("expected matrix animation to be cleared after turn completion")
+	}
+	if mm.sel.present {
+		t.Error("expected active selection to be cleared after turn completion")
+	}
+}

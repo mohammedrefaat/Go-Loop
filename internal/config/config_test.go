@@ -1419,3 +1419,20 @@ func TestSave_DoesNotPersistMCPJSONServers(t *testing.T) {
 		t.Errorf("expected only declared server to survive, got %+v", saved.MCP.Servers)
 	}
 }
+
+func TestLoadFile_ContextWindowAlias(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"context_window": 180000}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var cfg Config
+	if err := loadFile(path, &cfg); err != nil {
+		t.Fatalf("loadFile failed: %v", err)
+	}
+	if cfg.ContextWindow != 180000 {
+		t.Errorf("cfg.ContextWindow = %d, want 180000", cfg.ContextWindow)
+	}
+}
+

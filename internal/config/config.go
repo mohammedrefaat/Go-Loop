@@ -727,7 +727,18 @@ func loadFile(path string, cfg *Config) error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, cfg)
+	if err := json.Unmarshal(data, cfg); err != nil {
+		return err
+	}
+	if cfg.ContextWindow == 0 {
+		var alias struct {
+			ContextWindowSnake int64 `json:"context_window"`
+		}
+		if err := json.Unmarshal(data, &alias); err == nil && alias.ContextWindowSnake > 0 {
+			cfg.ContextWindow = alias.ContextWindowSnake
+		}
+	}
+	return nil
 }
 
 // APIKeys returns detected API keys from environment variables.

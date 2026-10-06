@@ -831,6 +831,8 @@ func (m *model) cancelAgent() {
 	m.statusModel.ActiveTools = nil
 	m.chatModel.Streaming = ""
 	m.chatModel.Thinking = ""
+	m.matrix.clear()
+	m.sel = selection{}
 	if m.face != nil {
 		m.face.SetMood(MoodIdle)
 	}
@@ -2097,6 +2099,7 @@ func (m *model) handleAgentDone(msg agentDoneMsg) (tea.Model, tea.Cmd) {
 	}
 	m.chatModel.Streaming = ""
 	m.chatModel.Thinking = ""
+	m.matrix.clear()
 	m.agentCh = nil
 	m.refreshDiffStats()
 	commitCmd := m.commitActiveTurn()
@@ -2129,6 +2132,7 @@ func (m *model) commitActiveTurn() tea.Cmd {
 	m.chatModel.Messages = m.chatModel.Messages[:0]
 	m.chatModel.HasCommitted = true
 	m.chatModel.Scroll = 0
+	m.sel = selection{}
 
 	if strings.TrimSpace(renderedTurn) == "" {
 		return nil

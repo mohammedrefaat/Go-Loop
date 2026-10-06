@@ -61,6 +61,7 @@ When you need to understand code before acting, follow this strategy — work to
 4. Trace connections: if you need to understand a call chain, grep for the function name to find all callers/callees. Follow import chains to build the full picture.
 
 Rules for efficient exploration:
+- Do not run tree, ls, or exploration tools for simple greetings ("hi", "hello"), pleasantries, or general queries that do not require inspecting the codebase. Respond directly to the user.
 - grep before read — always search for the symbol first, then read the specific file and line range.
 - Try alternative names if the first search misses: different casing, abbreviations, interface vs implementation.
 - For large codebases, use the subagent tool with {agent: "explore", task: "..."} to parallelize searches.
