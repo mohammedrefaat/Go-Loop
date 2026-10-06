@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/dimetron/pi-go/internal/agent"
+	"github.com/dimetron/pi-go/internal/checkpoint"
 	"github.com/dimetron/pi-go/internal/config"
 	"github.com/dimetron/pi-go/internal/extension"
 	"github.com/dimetron/pi-go/internal/logger"
@@ -87,6 +88,11 @@ type Config struct {
 	// wrapped LLM, resolved model name, and provider. Used by /model <name>.
 	// If nil, model switching via /model is disabled.
 	ModelSwitcher func(ctx context.Context, modelName string) (llmmodel.LLM, string, string, error)
+	// Checkpoints records a checkpoint at the start of each turn and holds the
+	// file snapshots /rewind restores. Nil disables checkpointing: no turn
+	// writes a checkpoint, no tool call snapshots a file, and /rewind reports
+	// that it is unavailable.
+	Checkpoints *checkpoint.Manager
 }
 
 // InitEvent reports progress from deferred initialization.
@@ -120,6 +126,8 @@ type InitResult struct {
 	AgentEventCh      <-chan AgentSubEvent
 	SystemNoticeCh    <-chan string
 	ContextBreakdown  *ContextBreakdown
+	// Checkpoints carries the turn-checkpoint manager from deferred init.
+	Checkpoints *checkpoint.Manager
 	TokenTracker      TokenTracker
 	CompactMetrics    CompactStatsProvider
 	GitBranch         string

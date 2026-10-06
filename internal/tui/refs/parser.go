@@ -1,6 +1,7 @@
 package refs
 
 import (
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -37,6 +38,14 @@ type LineRange struct {
 var refPattern = regexp.MustCompile(`@([a-z]+)(?::([^\s]*))?`)
 
 // parseRefs extracts all @ref patterns from input.
+//
+// Two forms are recognised. The typed form names what to read — @file:path,
+// @diff, @staged, @git:N, @url:... — and the bare form is a path directly,
+// @internal/tui/tui.go, which is the form the TUI advertises and the one users
+// type. The typed form is tried first so @file:x stays a file reference rather
+// than a path named "file:x"; a typed-looking token that names no known type
+// falls through to the bare form, so @diffusion/model.go is a path and not a
+// mistyped @diff.
 func parseRefs(input string) []ParsedRef {
 	var refs []ParsedRef
 
@@ -76,7 +85,14 @@ func parseRefs(input string) []ParsedRef {
 				continue
 			}
 		default:
-			// Unknown ref type - skip.
+			// Not a known type. Rather than dropping it, try the whole match
+			// as a bare path: "@diffusion/model.go" is a file, not a
+			// misspelled "@diff", and silently expanding nothing would leave
+			// the user staring at an @ that did nothing.
+			bare := strings.TrimRight(input[match[0]:match[1]], ",.;!?")
+			if ref, ok := ParseBareRef(bare); ok {
+				refs = append(refs, ref)
+			}
 			continue
 		}
 
@@ -95,6 +111,39 @@ func parseRefs(input string) []ParsedRef {
 	}
 
 	return refs
+}
+
+// ParseBareRef resolves a single untyped "@token" into a file reference with
+// any :N-M line range split off, reporting whether it was a path at all.
+//
+// It is exported because the TUI has to find mention tokens itself: expansion
+// happens on submit, when the tokens have to be lifted out of the prompt text
+// first, and that scan has to agree with what Expand would have accepted.
+func ParseBareRef(token string) (ParsedRef, bool) {
+	ref := strings.TrimPrefix(token, "@")
+	if ref == "" {
+		return ParsedRef{}, false
+	}
+	// A trailing colon with nothing after it is "@path:" — a path being typed,
+	// not a reference. Expanding it would attach a file the user has not
+	// finished naming.
+	if strings.HasSuffix(ref, ":") {
+		return ParsedRef{}, false
+	}
+	parsed := parseFileRef(ParsedRef{Type: RefFile, RawValue: ref, Value: ref})
+
+	// The test is deliberately narrow. "@model" is far more often an @-handle
+	// in prose than a file called "model", so a bare token must carry a path
+	// signal — a separator, a dot, or a leading drive/root — to count.
+	// Anything else is left in the text untouched.
+	base := filepath.Base(parsed.Value)
+	if !strings.ContainsAny(parsed.Value, `/\`) &&
+		!strings.Contains(base, ".") &&
+		!filepath.IsAbs(parsed.Value) &&
+		!strings.HasPrefix(parsed.Value, "~") {
+		return ParsedRef{}, false
+	}
+	return parsed, true
 }
 
 // parseFileRef parses line range from @file:path:start-end format.

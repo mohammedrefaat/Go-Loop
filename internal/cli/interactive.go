@@ -17,6 +17,7 @@ import (
 
 	"github.com/dimetron/pi-go/internal/agent"
 	"github.com/dimetron/pi-go/internal/autocompact"
+	"github.com/dimetron/pi-go/internal/checkpoint"
 	"github.com/dimetron/pi-go/internal/config"
 	"github.com/dimetron/pi-go/internal/extension"
 	"github.com/dimetron/pi-go/internal/guardrail"
@@ -49,6 +50,9 @@ type initResources struct {
 	// noticeCh is where startup messages go. Held on the struct because it is
 	// created by the caller, before the goroutine that builds the tools.
 	noticeCh chan string
+	// checkpoints records turn boundaries for /rewind. Built before the session
+	// exists and handed to the TUI through InitResult.
+	checkpoints *checkpoint.Manager
 }
 
 func (r *initResources) cleanup() {
@@ -279,14 +283,24 @@ func deferredInit(
 	instructionParts := buildDeferredInstructionParts()
 	instruction := instructionParts.String()
 
-	cbs := buildDeferredCallbacks(cfg, providerName, sandbox, ps.lspMgr, memRecorder)
-
 	// Session service.
 	sessionsPath, sessionSvc, err := openSessionService()
 	if err != nil {
 		fail(err)
 		return
 	}
+
+	// The checkpoint manager is built before the session ID is known, so the
+	// callback resolves the session directory at call time. Checkpoints belong
+	// to a session, and this is what makes the very first turn rewindable.
+	checkpointMgr := buildCheckpointManager(cfg)
+
+	cbs := buildDeferredCallbacks(cfg, providerName, sandbox, ps.lspMgr, memRecorder, checkpointMgr, func() string {
+		if sessionSvc == nil || res.sessionID == "" {
+			return ""
+		}
+		return sessionSvc.SessionDir(res.sessionID)
+	})
 
 	mcpToolsets := ps.mcpToolsets
 	// llms.txt documentation sources are cheap to build (no network), so they
@@ -354,6 +368,7 @@ func deferredInit(
 
 	// Store session ID for resume hint on exit.
 	res.sessionID = sessionID
+	res.checkpoints = checkpointMgr
 
 	// Two-stage auto-compaction, installed as a pre-turn hook so history is
 	// only ever rewritten between turns. It shares the caller's notice channel
@@ -399,6 +414,7 @@ func deferredInit(
 			SessionTitle:      defaultTitle,
 			Resumed:           resumed,
 			SessionService:    sessionSvc,
+			Checkpoints:       checkpointMgr,
 			Orchestrator:      orch,
 			Logger:            sessionLog,
 			Skills:            ps.skills,
@@ -596,11 +612,34 @@ func appendDeferredMemoryTools(cfg config.Config, cwd string, coreTools []adktoo
 
 // buildDeferredInstructionParts returns the system instruction as its parts:
 // --system replaces the base outright, otherwise the built-in set is loaded.
+//
+// --skill-touched names files the session has already worked on, which is what
+// opens the gate on `paths:`-scoped skills. At startup nothing is known, so
+// without it a gated skill is held back until the first relevant file is
+// touched — correct, but it costs the first turn in that area.
+//
+// The output style is prepended to Base rather than replacing it: a style
+// shapes the register, and the built-in prompt still carries the honesty and
+// safety rules that a "be terse" style should not switch off. --system is the
+// mechanism for a full replacement.
 func buildDeferredInstructionParts() agent.InstructionParts {
 	if flagSystem != "" {
 		return agent.InstructionParts{Base: flagSystem}
 	}
-	return agent.LoadInstructionParts(agent.SystemInstruction)
+	styleText, _ := loadOutputStyle()
+	var parts agent.InstructionParts
+	if len(flagSkillTouched) > 0 {
+		cwd, err := os.Getwd()
+		if err == nil {
+			parts = agent.LoadInstructionPartsTouched(agent.SystemInstruction, cwd, flagSkillTouched)
+		} else {
+			parts = agent.LoadInstructionParts(agent.SystemInstruction)
+		}
+	} else {
+		parts = agent.LoadInstructionParts(agent.SystemInstruction)
+	}
+	parts.Base = styleText + parts.Base
+	return parts
 }
 
 // deferredCallbacks is the callback wiring for the interactive agent, plus the
@@ -623,6 +662,8 @@ func buildDeferredCallbacks(
 	sandbox *tools.Sandbox,
 	lspMgr *lsp.Manager,
 	memRecorder *deferredMemoryRecorder,
+	checkpoints *checkpoint.Manager,
+	sessionDir func() string,
 ) deferredCallbacks {
 	compactorCfg := compactorConfigFrom(cfg)
 	compactMetrics := tools.NewCompactMetrics()
@@ -654,6 +695,13 @@ func buildDeferredCallbacks(
 		afterCBs = append(afterCBs, memRecorder.afterTool)
 	}
 
+	// Checkpoint capture goes in the *before* chain: the snapshot has to be
+	// taken while the old bytes still exist, which is before write runs, not
+	// after it returns.
+	if checkpoints != nil && sessionDir != nil {
+		beforeCBs = append(beforeCBs, checkpoint.BuildBeforeToolCallback(checkpoints, sessionDir))
+	}
+
 	return deferredCallbacks{
 		beforeTool:     beforeCBs,
 		afterTool:      afterCBs,
@@ -662,6 +710,27 @@ func buildDeferredCallbacks(
 		deduper:        resultDeduper,
 		compactMetrics: compactMetrics,
 	}
+}
+
+// buildCheckpointManager returns the checkpoint manager for this run, or nil
+// when checkpointing is off. A nil manager is the disabled state throughout:
+// no turn opens a checkpoint, no tool call snapshots a file, and /rewind
+// reports itself unavailable rather than opening an empty picker.
+func buildCheckpointManager(cfg config.Config) *checkpoint.Manager {
+	if !cfg.CheckpointsEnabled() {
+		return nil
+	}
+	opts := []checkpoint.Option{}
+	if c := cfg.Checkpoint; c != nil {
+		if c.Keep > 0 {
+			opts = append(opts, checkpoint.WithKeep(c.Keep))
+		}
+		if c.CleanupPeriodDays > 0 {
+			opts = append(opts, checkpoint.WithCleanupPeriod(
+				time.Duration(c.CleanupPeriodDays)*24*time.Hour))
+		}
+	}
+	return checkpoint.New(opts...)
 }
 
 // resolveDeferredSession returns the session to run in — the one named by

@@ -399,6 +399,17 @@ func (a *Agent) HasPreTurnHook() bool {
 	return a.preTurn != nil
 }
 
+// ModelName returns the model the agent is currently configured to call, or ""
+// when it has no model. It reports the *current* model, not the one the agent
+// was built with: /model rebuilds the runner against a new LLM, and a caller
+// emitting run accounting needs the model that actually served the run.
+func (a *Agent) ModelName() string {
+	if a == nil || a.config.Model == nil {
+		return ""
+	}
+	return a.config.Model.Name()
+}
+
 // runPreTurn invokes the hook if one is installed.
 func (a *Agent) runPreTurn(ctx context.Context, sessionID string) error {
 	if a.preTurn == nil {
@@ -842,8 +853,25 @@ func (p InstructionParts) String() string {
 
 // loadInstructionFrom is the testable core of LoadInstruction, resolving
 // context files and skills relative to explicit cwd and home directories.
+//
+// No files have been touched at this point, so the result is the same as
+// passing nil: ungated skills, gated skills held back. A caller that knows
+// what the session has touched should use LoadInstructionPartsTouched, since
+// suppressing a skill that is in fact relevant costs a round trip to recover.
 func loadInstructionFrom(baseInstruction, cwd, home string) string {
-	return loadInstructionPartsFrom(baseInstruction, cwd, home).String()
+	return loadInstructionPartsTouchedFrom(baseInstruction, cwd, home, nil).String()
+}
+
+// LoadInstructionPartsTouched resolves the system prompt for an explicit
+// working directory, gating `paths:`-scoped skills against the files the
+// session has already touched.
+func LoadInstructionPartsTouched(baseInstruction, cwd string, touched []string) InstructionParts {
+	home, _ := os.UserHomeDir()
+	return loadInstructionPartsTouchedFrom(baseInstruction, cwd, home, touched)
+}
+
+func loadInstructionPartsTouchedFrom(baseInstruction, cwd, home string, touched []string) InstructionParts {
+	return loadInstructionPartsGated(baseInstruction, cwd, home, touched)
 }
 
 // LoadInstructionPartsFor resolves the system prompt for an explicit working
@@ -977,6 +1005,14 @@ var localeRegionNames = map[string]string{
 }
 
 func loadInstructionPartsFrom(baseInstruction, cwd, home string) InstructionParts {
+	return loadInstructionPartsGated(baseInstruction, cwd, home, nil)
+}
+
+// loadInstructionPartsGated is the one place the system prompt is assembled, so
+// the `paths:` gate is applied in exactly one spot. touched is the set of files
+// the session has worked on; nil means nothing is known yet, which holds back
+// every gated skill.
+func loadInstructionPartsGated(baseInstruction, cwd, home string, touched []string) InstructionParts {
 	parts := InstructionParts{Base: prependEnvironmentContext(baseInstruction, os.Getenv("HOME"), os.Getenv("USER"), os.Getenv("PWD"), os.Getenv("LANG"), cwd)}
 
 	if contents := discoverContextFiles(cwd, home); len(contents) > 0 {
@@ -991,7 +1027,15 @@ func loadInstructionPartsFrom(baseInstruction, cwd, home string) InstructionPart
 	skillDirs := extension.DefaultSkillDirsIn(cwd)
 	skills, err := extension.LoadSkills(skillDirs...)
 	if err == nil && len(skills) > 0 {
-		parts.Skills = appendSkillsMenu(skills)
+		// FilterByPaths keeps every ungated skill, so this is a no-op for a
+		// corpus that has never adopted `paths:`.
+		//
+		// The emptiness check is on the filtered list, not the loaded one: a
+		// session whose skills are all gated can filter down to nothing, and
+		// the heading would then be emitted with no entries under it.
+		if relevant := extension.FilterByPaths(skills, touched); len(relevant) > 0 {
+			parts.Skills = appendSkillsMenu(relevant)
+		}
 	}
 
 	return parts
@@ -1000,7 +1044,14 @@ func loadInstructionPartsFrom(baseInstruction, cwd, home string) InstructionPart
 // appendSkillsMenu formats the "# Available Skills" block for a pre-loaded
 // skill slice. Exposed so callers that already have skills in hand (e.g. the
 // TUI) don't trigger a second LoadSkills.
+//
+// An empty slice yields an empty string, not a bare heading: the `paths:` gate
+// can legitimately filter every skill out of a session, and "# Available
+// Skills" with nothing under it is worse than no section at all.
 func appendSkillsMenu(skills []extension.Skill) string {
+	if len(skills) == 0 {
+		return ""
+	}
 	var b strings.Builder
 	b.WriteString("\n\n# Available Skills\n\n")
 	for _, s := range skills {

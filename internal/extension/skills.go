@@ -27,6 +27,10 @@ type Skill struct {
 	BodyPath string
 	// Tools lists tool names this skill is allowed to use (from frontmatter).
 	Tools []string
+	// Paths lists file globs gating when this skill is injected: the skill is
+	// offered only when the session has touched a matching file. Empty means
+	// ungated, which is every skill written before this key existed.
+	Paths []string
 	// Source is where the skill came from: "bundled", "user", or "project".
 	Source string
 }
@@ -239,6 +243,7 @@ func auditRejects(opts LoadOptions, skillInfo skillCandidate, blocked *[]string)
 //	name: skill-name
 //	description: one-line description
 //	tools: read, write, bash
+//	paths: internal/tui/**, internal/tools/**
 //	---
 //	Markdown instruction body...
 func parseSkillFile(path string) (Skill, error) {
@@ -306,7 +311,40 @@ func applyFrontmatterLine(skill *Skill, line string) {
 		skill.Description = value
 	case "tools":
 		skill.Tools = append(skill.Tools, splitSkillTools(value)...)
+	case "paths":
+		skill.Paths = append(skill.Paths, splitSkillPaths(skill.Name, value)...)
 	}
+}
+
+// splitSkillPaths parses a "paths:" frontmatter value, accepting both the
+// comma-separated spelling and the JSON-ish flow list:
+//
+//	paths: internal/tui/**, internal/tools/**
+//	paths: ["internal/tui/**", "docs/**"]
+//
+// A block list (one "- glob" per line on the following lines) is *not*
+// supported: the frontmatter parser is line-oriented, so a bare "paths:"
+// would parse as empty and leave the skill ungated. That fails open, which is
+// the safe direction, but silently — so it is reported instead. Writing the
+// value on one line is the fix.
+func splitSkillPaths(skillName, value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		notice.Notifyf("warning: skill %q has a block `paths:` list, which is not supported; "+
+			"write the globs on one line to gate the skill", skillName)
+		return nil
+	}
+	// Trim the brackets of a flow list before splitting, so entries are not
+	// left with a stray quote.
+	value = strings.TrimPrefix(value, "[")
+	value = strings.TrimSuffix(value, "]")
+	var paths []string
+	for _, p := range strings.Split(value, ",") {
+		if p = strings.Trim(strings.TrimSpace(p), `"'`); p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
 }
 
 // splitSkillTools splits a comma-separated "tools:" value, trimming each entry

@@ -265,4 +265,3 @@ func TestDragOnCommittedScrollbackFlashesTip(t *testing.T) {
 		t.Errorf("flash = %q, want scrollback copy tip", mm.flash)
 	}
 }
-

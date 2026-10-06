@@ -310,28 +310,11 @@ func printProviderModels(providerName string, models []provider.ModelInfo) {
 // published on ollama.com/pricing, vendored in the ollama-cloud pricing
 // snapshot.
 func modelPrice(providerName, modelID string) string {
-	if providerName == "ollama" && provider.IsOllamaCloudModel(modelID) {
-		if pm, ok := provider.OllamaCloudCost(ollamaCloudPriceKey(modelID)); ok {
-			return formatModelPrice(pm)
-		}
-	}
-	pm, ok := provider.CostFor(providerName, modelID)
+	pm, ok := provider.CostForModel(providerName, modelID)
 	if !ok {
 		return ""
 	}
 	return formatModelPrice(pm)
-}
-
-// ollamaCloudPriceKey strips the cloud tag from an Ollama model name so it
-// matches the base IDs in the ollama-cloud pricing snapshot: both the ":cloud"
-// form and the "<size>-cloud" suffix the catalog mostly uses. The part before
-// the tag is kept — a dated cloud ID (deepseek-v4-flash:0731-cloud) still
-// carries its date so the prefix lookup resolves the right base entry.
-func ollamaCloudPriceKey(modelID string) string {
-	if i := strings.LastIndex(modelID, "-cloud"); i >= 0 {
-		return modelID[:i]
-	}
-	return strings.TrimSuffix(modelID, ":cloud")
 }
 
 // formatModelPrice renders a PricingModel as the "$in/$out per 1M" figure the

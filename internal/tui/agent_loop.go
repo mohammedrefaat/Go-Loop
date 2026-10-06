@@ -966,6 +966,11 @@ func (m *model) agentRun() agentRunConfig {
 type queuedPrompt struct {
 	text     string
 	mentions []string
+	// expanded records that the @/! prefixes in this prompt were already
+	// resolved into promptText. A queued prompt is expanded once, when it is
+	// dequeued, and must not be expanded again: the second pass would find the
+	// attachment text already in place and report it as nothing left to do.
+	expanded bool
 }
 
 const maxPendingPrompts = 32
@@ -985,12 +990,62 @@ func (m *model) startNextPrompt() (tea.Model, tea.Cmd) {
 	}
 	next := m.pendingPrompts[0]
 	m.pendingPrompts = m.pendingPrompts[1:]
+
+	// Expanding a mention reads files and a !cmd runs a shell, so it cannot
+	// happen on the goroutine that renders the UI — a slow command would freeze
+	// the terminal with no way to see or cancel it. The prompt is expanded as a
+	// command and the turn starts when the result comes back through Update, by
+	// which time Bubble Tea has repainted.
+	//
+	// The busy flag is its own field rather than `running`: `running` means an
+	// agent turn is in flight and Esc cancels it, and there is no agent yet to
+	// cancel here. Faking it would make Esc report a turn that does not exist.
+	if hasAttachmentPrefix(next.text) {
+		m.expanding = true
+		m.flash = "Resolving attachments…"
+		visible := next.text
+		return m, func() tea.Msg {
+			return attachmentsReadyMsg{visible: visible, outcome: m.resolveMentions(next.text)}
+		}
+	}
 	return m.submitPrompt(next.text, next.mentions)
 }
 
-// submitPrompt sends a user prompt to the agent.
+// attachmentsReadyMsg delivers the resolved prompt from the expansion command.
+// It carries the user's own text as well as the expansion, so the turn can show
+// what was typed and send what was resolved without the model holding either.
+type attachmentsReadyMsg struct {
+	visible string
+	outcome mentionOutcome
+}
+
+// handleAttachmentsReady starts the turn from the expanded prompt, reporting
+// anything that was refused. The refusals are shown before the turn runs: a
+// silent omission would leave the model answering a question the user thought
+// included a file.
+func (m *model) handleAttachmentsReady(msg attachmentsReadyMsg) (tea.Model, tea.Cmd) {
+	m.expanding = false
+	m.flash = ""
+
+	if len(msg.outcome.Refused) > 0 {
+		m.appendNotice(strings.Join(msg.outcome.Refused, "\n"))
+	}
+	if len(msg.outcome.Attached) > 0 {
+		m.appendNotice("Attached: " + strings.Join(msg.outcome.Attached, ", "))
+	}
+
+	if strings.TrimSpace(msg.outcome.Text) == "" {
+		// Nothing survives without its attachments, so there is no prompt left
+		// to send. Say so rather than starting a turn on an empty question.
+		m.appendNotice("Nothing left to send — every attachment in that prompt was refused.")
+		return m, nil
+	}
+	return m.submitResolvedPrompt(msg.visible, msg.outcome.Text)
+}
+
+// submitPrompt sends a user prompt to the agent. An expanded prompt arrives
+// with its attachments already inlined and nothing further to resolve.
 func (m *model) submitPrompt(text string, mentions []string) (tea.Model, tea.Cmd) {
-	// Append referenced file annotations for @mentions.
 	promptText := text
 	if len(mentions) > 0 {
 		var refs strings.Builder
@@ -1003,7 +1058,12 @@ func (m *model) submitPrompt(text string, mentions []string) (tea.Model, tea.Cmd
 		}
 		promptText = refs.String()
 	}
+	return m.submitResolvedPrompt(text, promptText)
+}
 
+// submitResolvedPrompt starts a turn from the text the user sees and the text
+// the agent receives, which differ whenever an attachment was expanded.
+func (m *model) submitResolvedPrompt(visible, promptText string) (tea.Model, tea.Cmd) {
 	if m.cfg.Logger != nil {
 		m.cfg.Logger.UserMessage(promptText)
 	}
@@ -1012,9 +1072,13 @@ func (m *model) submitPrompt(text string, mentions []string) (tea.Model, tea.Cmd
 	// emit OSC 0 to update the terminal window/tab title. Best-effort: a
 	// session service that doesn't support titles (or a non-TTY stdout) is
 	// a no-op, never a turn blocker.
-	m.applySessionTitle(text)
+	m.applySessionTitle(visible)
 
-	m.chatModel.Messages = append(m.chatModel.Messages, message{role: "user", content: text})
+	// The turn boundary. Everything the agent does from here belongs to this
+	// checkpoint, and /rewind restores to the index recorded here.
+	m.beginCheckpoint(visible)
+
+	m.chatModel.Messages = append(m.chatModel.Messages, message{role: "user", content: visible})
 	m.chatModel.Messages = append(m.chatModel.Messages, message{role: "assistant", content: ""})
 	m.chatModel.Streaming = ""
 	m.chatModel.Thinking = ""
@@ -1027,6 +1091,44 @@ func (m *model) submitPrompt(text string, mentions []string) (tea.Model, tea.Cmd
 	m.matrix.feed("init", m.mainWidth())
 
 	return m, tea.Batch(m.startAgentLoop(promptText), matrixTickCmd())
+}
+
+// beginCheckpoint opens this turn's checkpoint, at the event count the session
+// holds right now — before the user message is appended, so the recorded index
+// is the start of the conversation this turn begins.
+//
+// Every failure is swallowed into the session log. A missing checkpoint costs
+// the user one rewind point; refusing the prompt would cost them the turn, and
+// the feature is not worth that.
+func (m *model) beginCheckpoint(prompt string) {
+	if m.cfg.Checkpoints == nil || m.cfg.SessionService == nil || m.cfg.SessionID == "" {
+		return
+	}
+	dir := m.sessionDir()
+	if dir == "" {
+		return
+	}
+	n, err := m.cfg.SessionService.EventCount(m.cfg.SessionID, agent.AppName, agent.DefaultUserID)
+	if err != nil {
+		m.loggerErrorf("checkpoint: counting events: %v", err)
+		return
+	}
+	if _, err := m.cfg.Checkpoints.Begin(dir, n, prompt); err != nil {
+		m.loggerErrorf("checkpoint: %v", err)
+	}
+}
+
+// endCheckpoint closes this turn's checkpoint. The turn's boundary is its
+// prompt, not its last write, so the manager is told here rather than after the
+// final tool call — a write from the *next* turn must not land in this one's
+// snapshot set.
+func (m *model) endCheckpoint() {
+	if m.cfg.Checkpoints == nil {
+		return
+	}
+	if dir := m.sessionDir(); dir != "" {
+		m.cfg.Checkpoints.End(dir)
+	}
 }
 
 // applySessionTitle derives a short title from the user prompt, records it on
@@ -1972,7 +2074,7 @@ func (m *model) handleAgentDone(msg agentDoneMsg) (tea.Model, tea.Cmd) {
 	m.invalidatePlanPhases()
 	m.running = false
 	m.agentCancel = nil
-	m.matrix.clear()
+	m.endCheckpoint()
 	m.statusModel.ActiveTool = ""
 	m.statusModel.ActiveTools = nil
 	if msg.err == nil && m.mode == "plan" && m.planWorktree != nil {

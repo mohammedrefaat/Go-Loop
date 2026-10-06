@@ -64,6 +64,12 @@ func matchSpecifier(pattern, arg string) bool {
 		if prefix == "" {
 			return true
 		}
+		// A leading wildcard makes this a free-form glob rather than a
+		// "family" prefix rule: "*marker*" must match "echo > marker.txt",
+		// not just strings that happen to start with "marker".
+		if strings.HasPrefix(pattern, "*") {
+			return globMatch(pattern, arg)
+		}
 		return strings.HasPrefix(arg, prefix)
 	}
 	if strings.ContainsAny(pattern, "*?") {

@@ -85,11 +85,11 @@ func TestCplxSlashCommandSpecs_CoverExpectedSet(t *testing.T) {
 	want := []string{
 		"/help", "/clear", "/copy", "/model", "/session", "/resume", "/rename", "/export",
 		"/context", "/branch",
-		"/compact", "/subagents", "/history", "/login", "/commit", "/plan", "/run",
+		"/compact", "/rewind", "/subagents", "/history", "/login", "/commit", "/plan", "/run",
 		"/pr-autofix",
 		"/skills", "/skill-list", "/skill-load", "/skill-create", "/theme", "/mouse", "/ping",
 		"/model-price-refresh",
-		"/rtk", "/mcp", "/exit", "/quit",
+		"/rtk", "/mcp", "/import", "/keybindings", "/doctor", "/exit", "/quit",
 	}
 	if len(slashCommandSpecs) != len(want) {
 		t.Fatalf("slashCommandSpecs has %d entries, want %d", len(slashCommandSpecs), len(want))
@@ -115,11 +115,11 @@ func TestCplxSlashCommands_DerivedOrder(t *testing.T) {
 	want := []string{
 		"/help", "/clear", "/copy", "/model", "/session", "/resume", "/rename", "/export",
 		"/context", "/branch",
-		"/compact", "/subagents", "/history", "/login", "/commit", "/plan", "/run",
+		"/compact", "/rewind", "/subagents", "/history", "/login", "/commit", "/plan", "/run",
 		// After /plan, so "/p" still completes to /plan and "/pr" is
 		// unambiguous: autocomplete returns the first prefix match.
 		"/pr-autofix",
-		"/skills", "/theme", "/mouse", "/ping", "/model-price-refresh", "/rtk", "/mcp", "/exit", "/quit",
+		"/skills", "/theme", "/import", "/keybindings", "/doctor", "/mouse", "/ping", "/model-price-refresh", "/rtk", "/mcp", "/exit", "/quit",
 	}
 	if len(slashCommands) != len(want) {
 		t.Fatalf("slashCommands = %v (%d), want %d entries", slashCommands, len(slashCommands), len(want))

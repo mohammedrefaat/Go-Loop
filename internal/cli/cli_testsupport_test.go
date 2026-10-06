@@ -11,17 +11,19 @@ import (
 func resetGlobalFlags(t *testing.T) {
 	t.Helper()
 	orig := struct {
-		model, mode, session, socket, url, system, pprof, pprofPort, cpuProfile string
-		headers                                                                 []string
-		cont, insecure, smol, slow, plan, memOff                                bool
-		loginModel                                                              string
-		serveAddr, serveProject, serveModel, serveURL                           string
-		serveHeaders                                                            []string
-		servePairing                                                            time.Duration
-		serveInsecure                                                           bool
+		model, mode, session, socket, url, system, outputStyle, pprof, pprofPort, cpuProfile string
+		headers                                                                              []string
+		skillTouched                                                                         []string
+		cont, insecure, smol, slow, plan, memOff                                             bool
+		loginModel                                                                           string
+		serveAddr, serveProject, serveModel, serveURL                                        string
+		serveHeaders                                                                         []string
+		servePairing                                                                         time.Duration
+		serveInsecure                                                                        bool
 	}{
-		flagModel, flagMode, flagSession, flagSocket, flagURL, flagSystem, flagPprof, flagPprofPort, flagCPUProfile,
+		flagModel, flagMode, flagSession, flagSocket, flagURL, flagSystem, flagOutputStyle, flagPprof, flagPprofPort, flagCPUProfile,
 		flagHeaders,
+		flagSkillTouched,
 		flagContinue, flagInsecure, flagSmol, flagSlow, flagPlan, flagMemoryOff,
 		flagLoginModel,
 		flagServeAddr, flagServeProject, flagServeModel, flagServeURL,
@@ -36,6 +38,8 @@ func resetGlobalFlags(t *testing.T) {
 		flagSocket = orig.socket
 		flagURL = orig.url
 		flagSystem = orig.system
+		flagOutputStyle = orig.outputStyle
+		flagSkillTouched = orig.skillTouched
 		flagPprof = orig.pprof
 		flagPprofPort = orig.pprofPort
 		flagCPUProfile = orig.cpuProfile
@@ -62,6 +66,8 @@ func resetGlobalFlags(t *testing.T) {
 	flagSocket = "/tmp/pi-go.sock"
 	flagURL = ""
 	flagSystem = ""
+	flagOutputStyle = ""
+	flagSkillTouched = nil
 	flagPprof = ""
 	flagPprofPort = "6060"
 	flagCPUProfile = ""

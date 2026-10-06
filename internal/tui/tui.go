@@ -21,6 +21,7 @@ import (
 	"github.com/dimetron/pi-go/internal/auth"
 	"github.com/dimetron/pi-go/internal/config"
 	"github.com/dimetron/pi-go/internal/extension"
+	"github.com/dimetron/pi-go/internal/keymap"
 	"github.com/dimetron/pi-go/internal/palace"
 	"github.com/dimetron/pi-go/internal/sop"
 	"github.com/dimetron/pi-go/internal/subagent"
@@ -139,6 +140,15 @@ type model struct {
 	// Skill-create pending overwrite confirmation.
 	pendingSkillCreate *pendingSkillCreate
 
+	// pendingClaudeImport is a previewed /import claude plan awaiting
+	// confirmation, or nil.
+	pendingClaudeImport *pendingClaudeImport
+
+	// keymap resolves keys to actions, layering the user's
+	// ~/.pi-go/keybindings.json over the defaults. Nil leaves every key on its
+	// built-in behaviour.
+	keymap *keymap.Keymap
+
 	// Run flow state (/run command).
 	run *runState
 
@@ -154,6 +164,22 @@ type model struct {
 
 	// Session picker interactive menu (/resume).
 	sessionPicker *sessionPickerState
+
+	// Rewind turn picker (/rewind, Esc Esc).
+	rewindPicker *rewindPickerState
+	// expanding is true while a prompt's @mentions and !commands are being
+	// resolved. It is separate from running because no agent turn exists yet:
+	// the wait is for the user's own shell command, and Esc must not report
+	// cancelling a turn that has not started.
+	expanding bool
+
+	// lastEsc is when the last Esc arrived, and escArmed whether it is still a
+	// live candidate for the Esc-Esc double-tap. Esc is consumed by
+	// handleInterruptKey — it always handles — so the second press has to be
+	// recognised from state rather than by falling through to a second
+	// handler.
+	lastEsc  time.Time
+	escArmed bool
 	// permissionPrompt is the pending tool-approval question, or nil. It is
 	// written by the agent goroutine (via Approver) as well as by Update, so it
 	// is the one piece of UI state that permissionPromptMu guards. The mutex
@@ -590,6 +616,7 @@ func newModel(ctx context.Context, cancel context.CancelFunc, cfg Config) *model
 		themeManager: tm,
 		palette:      palette,
 		face:         NewFaceRenderer(),
+		keymap:       keymap.New(),
 	}
 	m.syncPalette()
 	// The renderer above was built from this palette, so record its key rather
@@ -782,6 +809,10 @@ func (m *model) updateTerminal(msg tea.Msg) (tea.Model, tea.Cmd, bool) {
 
 	case matrixTickMsg:
 		return m.handleMatrixTick()
+
+	case attachmentsReadyMsg:
+		model, cmd := m.handleAttachmentsReady(msg)
+		return model, cmd, true
 	}
 	return nil, nil, false
 }
@@ -1184,6 +1215,17 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return model, cmd
 		}
 	}
+	if m.rewindPicker != nil {
+		if model, cmd, handled := m.handleRewindPickerKey(msg); handled {
+			return model, cmd
+		}
+	}
+
+	// Any key that is not the first Esc ends a pending Esc-Esc, so the gesture
+	// never fires across an unrelated keystroke.
+	if key.Code != tea.KeyEsc {
+		m.disarmRewindEscape()
+	}
 
 	for _, handle := range []keyHandler{
 		m.handlePermissionPromptKey,
@@ -1191,6 +1233,7 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.handleCommitKey,
 		m.handleLoginKey,
 		m.handleSkillCreateKey,
+		m.handleImportClaudeKey,
 		m.handleBranchPopupKey,
 		m.handleInterruptKey,
 	} {
@@ -1210,6 +1253,9 @@ func (m *model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.handleScrollKey,
 	} {
 		if model, cmd, handled := handle(key); handled {
+			// Reported after the handler, so a key that resolved fine is not
+			// followed by a warning about a different line of the file.
+			m.reportKeymapWarnings()
 			return model, cmd
 		}
 	}
@@ -1331,6 +1377,23 @@ func (m *model) handleInterruptKey(key tea.Key) (tea.Model, tea.Cmd, bool) {
 		}
 		if m.running {
 			m.cancelAgent()
+			// A cancelled run leaves the session mid-turn, with no checkpoint
+			// open and files half-written. Rewinding from there would restore a
+			// boundary the aborted turn never reached, so the Esc-Esc route is
+			// left for when nothing is running.
+			m.escArmed = false
+			return m, nil, true
+		}
+		if m.expanding {
+			// A shell command is running, not an agent turn, so there is
+			// nothing to cancel and no turn to rewind to. The two-Esc gesture
+			// must not arm either: it would open a picker over a prompt that is
+			// about to start a turn.
+			m.escArmed = false
+			return m, nil, true
+		}
+		if m.tryRewindEscape() {
+			return m, nil, true
 		}
 		return m, nil, true
 
@@ -1356,18 +1419,67 @@ func (m *model) handleInterruptKey(key tea.Key) (tea.Model, tea.Cmd, bool) {
 	return nil, nil, false
 }
 
-// handleToggleKey handles the Ctrl-chord toggles and the search popup.
+// handleToggleKey handles the rebindable Ctrl-chord toggles and the search
+// popup.
+//
+// Each key is resolved through the keymap first, so a binding in
+// ~/.pi-go/keybindings.json shadows the built-in default. A key bound to
+// nothing (an explicit unbind) returns handled with no effect, which is what
+// stops the hardcoded default underneath from firing anyway.
 func (m *model) handleToggleKey(key tea.Key) (tea.Model, tea.Cmd, bool) {
-	// Ctrl+O: toggle compact/expanded tool output.
-	if key.Code == 'o' && key.Mod == tea.ModCtrl {
-		m.chatModel.ToolDisplay.CompactTools = !m.chatModel.ToolDisplay.CompactTools
-		return m, nil, true
+	if m.keymap == nil {
+		// No keymap — a bare test model, or a startup that could not read one.
+		// The built-in behaviour still applies; a nil keymap means "defaults",
+		// not "nothing is bound".
+		return m.hardcodedToggleKey(key)
+	}
+	if action, bound := m.keymapAction(keymap.ContextChat, key); bound {
+		switch action {
+		case keymap.ActionToggleTools:
+			m.chatModel.ToolDisplay.CompactTools = !m.chatModel.ToolDisplay.CompactTools
+			return m, nil, true
+		case keymap.ActionToggleBranch:
+			// Only when the prompt is empty. The standard text input uses
+			// Ctrl+B as backward cursor movement, and some terminals emit it
+			// for left/back navigation.
+			if m.inputModel.Text == "" && m.statusModel.GitBranch != "" {
+				if m.branchPopup == nil {
+					m.newBranchPopup()
+				} else {
+					m.branchPopup = nil
+				}
+			}
+			return m, nil, true
+		case keymap.ActionHistorySearch:
+			// With no history to search, fall through to the input rather than
+			// opening an empty popup.
+			if m.searchPopup == nil && len(m.inputModel.History) > 0 {
+				m.newSearchPopup(searchModeHistory)
+				return m, nil, true
+			}
+			return nil, nil, false
+		case keymap.ActionNone:
+			return m, nil, true
+		}
 	}
 
-	// Ctrl+B toggles the branch popup only when the prompt is empty. The
-	// standard text input uses Ctrl+B as backward cursor movement, and some
-	// terminals emit it for left/back navigation.
-	if key.Code == 'b' && key.Mod == tea.ModCtrl && m.inputModel.Text == "" {
+	// Unified search popup keys (slash commands or history).
+	if m.handleSearchPopupKey(key) {
+		return m, nil, true
+	}
+	return nil, nil, false
+}
+
+// hardcodedToggleKey is the pre-keymap behaviour, kept verbatim for the
+// no-keymap path. It is what keymap.New() encodes as defaults, so the two
+// agree; the copy exists because a nil keymap is a legitimate state and
+// losing Ctrl+O to it would be a bug.
+func (m *model) hardcodedToggleKey(key tea.Key) (tea.Model, tea.Cmd, bool) {
+	switch {
+	case key.Code == 'o' && key.Mod == tea.ModCtrl:
+		m.chatModel.ToolDisplay.CompactTools = !m.chatModel.ToolDisplay.CompactTools
+		return m, nil, true
+	case key.Code == 'b' && key.Mod == tea.ModCtrl && m.inputModel.Text == "":
 		if m.statusModel.GitBranch != "" {
 			if m.branchPopup == nil {
 				m.newBranchPopup()
@@ -1376,17 +1488,11 @@ func (m *model) handleToggleKey(key tea.Key) (tea.Model, tea.Cmd, bool) {
 			}
 		}
 		return m, nil, true
-	}
-
-	// Unified search popup keys (slash commands or history).
-	if m.handleSearchPopupKey(key) {
+	case key.Code == 'r' && key.Mod == tea.ModCtrl && m.searchPopup == nil && len(m.inputModel.History) > 0:
+		m.newSearchPopup(searchModeHistory)
 		return m, nil, true
 	}
-
-	// Ctrl+R: open history search popup (reverse-i-search style). With no
-	// history to search the key falls through to the input.
-	if key.Code == 'r' && key.Mod == tea.ModCtrl && m.searchPopup == nil && len(m.inputModel.History) > 0 {
-		m.newSearchPopup(searchModeHistory)
+	if m.handleSearchPopupKey(key) {
 		return m, nil, true
 	}
 	return nil, nil, false
@@ -1409,16 +1515,49 @@ func (m *model) handleHistoryKey(key tea.Key) (tea.Model, tea.Cmd, bool) {
 	if m.searchPopup != nil || m.shouldShowSlashCommandPopup() {
 		return nil, nil, false
 	}
-	switch key.Code {
-	case tea.KeyUp:
+	// Up and Down are bound once, in the chat context, and the action decides
+	// which context it was meant for. That is why the keymap is asked here
+	// rather than in handleScrollKey: the same key means "history" at the
+	// prompt and "scroll" over the transcript, and only the action can say
+	// which one the user meant.
+	action, bound := m.keymapAction(keymap.ContextChat, key)
+	if !bound && m.keymap == nil {
+		// No keymap: fall back to the built-in arrow handling.
+		switch key.Code {
+		case tea.KeyUp:
+			if len(m.inputModel.History) == 0 {
+				m.chatModel.ScrollUp(3, m.height)
+				return m, nil, true
+			}
+			m.newSearchPopup(searchModeHistory)
+			return m, nil, true
+		case tea.KeyDown:
+			m.chatModel.ScrollDown(3)
+			return m, nil, true
+		}
+		return nil, nil, false
+	}
+	if !bound {
+		return nil, nil, false
+	}
+	switch action {
+	case keymap.ActionHistoryPrevious:
 		if len(m.inputModel.History) == 0 {
 			m.chatModel.ScrollUp(3, m.height)
 			return m, nil, true
 		}
 		m.newSearchPopup(searchModeHistory)
 		return m, nil, true
-	case tea.KeyDown:
+	case keymap.ActionHistoryNext:
 		m.chatModel.ScrollDown(3)
+		return m, nil, true
+	case keymap.ActionScrollUpLine:
+		m.chatModel.ScrollUp(3, m.height)
+		return m, nil, true
+	case keymap.ActionScrollDownLine:
+		m.chatModel.ScrollDown(3)
+		return m, nil, true
+	case keymap.ActionNone:
 		return m, nil, true
 	}
 	return nil, nil, false
@@ -1426,12 +1565,31 @@ func (m *model) handleHistoryKey(key tea.Key) (tea.Model, tea.Cmd, bool) {
 
 // handleScrollKey pages the chat viewport.
 func (m *model) handleScrollKey(key tea.Key) (tea.Model, tea.Cmd, bool) {
-	switch key.Code {
-	case tea.KeyPgUp:
+	action, bound := m.keymapAction(keymap.ContextTranscript, key)
+	if !bound {
+		if m.keymap == nil {
+			// No keymap: the built-in page keys.
+			switch key.Code {
+			case tea.KeyPgUp:
+				m.chatModel.ScrollUp(5, m.height)
+				return m, nil, true
+			case tea.KeyPgDown:
+				m.chatModel.ScrollDown(5)
+				return m, nil, true
+			}
+		}
+		return nil, nil, false
+	}
+	switch action {
+	case keymap.ActionScrollUp:
 		m.chatModel.ScrollUp(5, m.height)
 		return m, nil, true
-	case tea.KeyPgDown:
+	case keymap.ActionScrollDown:
 		m.chatModel.ScrollDown(5)
+		return m, nil, true
+	case keymap.ActionNone:
+		// Explicitly unbound: swallow it rather than letting it reach the
+		// input, which would insert a page key into the prompt.
 		return m, nil, true
 	}
 	return nil, nil, false
@@ -1644,6 +1802,12 @@ func (m *model) View() tea.View {
 				count := strings.Count(picker, "\n") + 1
 				visibleMessages = strings.Repeat("\n ", count)
 			}
+		} else if m.rewindPicker != nil {
+			picker := m.renderRewindPicker(max(30, min(bodyWidth-4, 80)))
+			if picker != "" {
+				count := strings.Count(picker, "\n") + 1
+				visibleMessages = strings.Repeat("\n ", count)
+			}
 		} else if m.searchPopup != nil {
 			popup := m.renderSearchPopup(max(0, bodyWidth-4))
 			if popup != "" {
@@ -1665,6 +1829,7 @@ func (m *model) View() tea.View {
 	}
 	visibleMessages = m.overlayModelPicker(visibleMessages, bodyWidth)
 	visibleMessages = m.overlaySessionPicker(visibleMessages, bodyWidth)
+	visibleMessages = m.overlayRewindPicker(visibleMessages, bodyWidth)
 	visibleMessages = m.overlaySearchPopup(visibleMessages, bodyWidth)
 	// Last, so an approval question is never painted under by another overlay:
 	// a question the user cannot see blocks the agent with no way to answer it.
@@ -2504,6 +2669,7 @@ func (m *model) handleInitEvent(msg initEventMsg) (tea.Model, tea.Cmd) {
 			m.sessionTitle = r.SessionTitle
 		}
 		m.cfg.SessionService = r.SessionService
+		m.cfg.Checkpoints = r.Checkpoints
 		m.cfg.Orchestrator = r.Orchestrator
 		m.cfg.Logger = r.Logger
 		if r.Logger != nil {
@@ -2560,7 +2726,7 @@ func (m *model) handleInitEvent(msg initEventMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) shouldShowSlashCommandPopup() bool {
-	if m.running || m.loading || m.login != nil || m.commit != nil || m.pendingSkillCreate != nil || m.modelPicker != nil || m.sessionPicker != nil {
+	if m.running || m.expanding || m.loading || m.login != nil || m.commit != nil || m.pendingSkillCreate != nil || m.modelPicker != nil || m.sessionPicker != nil || m.rewindPicker != nil {
 		return false
 	}
 	text := m.inputModel.Text

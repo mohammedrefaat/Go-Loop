@@ -128,6 +128,111 @@ func CostFor(providerName, modelName string) (PricingModel, bool) {
 	return lookupPricing(providerName, modelName)
 }
 
+// CostForModel returns the per-million-token rates for any model pi-go can
+// serve, including Ollama Cloud.
+//
+// It is CostFor plus the one case CostFor cannot cover: models.dev publishes no
+// ollama entry, so a cloud-tagged Ollama model has to come from the vendored
+// snapshot. Callers that need rates for cost accounting should use this rather
+// than re-deriving the branch.
+func CostForModel(providerName, modelID string) (PricingModel, bool) {
+	if providerName == "ollama" && IsOllamaCloudModel(modelID) {
+		if pm, ok := OllamaCloudCost(OllamaCloudPriceKey(modelID)); ok {
+			return pm, true
+		}
+	}
+	return CostFor(providerName, modelID)
+}
+
+// OllamaCloudPriceKey strips the cloud tag from an Ollama model name so it
+// matches the base IDs in the Ollama Cloud pricing snapshot: both the ":cloud"
+// form and the "<size>-cloud" suffix the catalog mostly uses. The part before
+// the tag is kept — a dated cloud ID (deepseek-v4-flash:0731-cloud) still
+// carries its date so the prefix lookup resolves the right base entry.
+func OllamaCloudPriceKey(modelID string) string {
+	if i := strings.LastIndex(modelID, "-cloud"); i >= 0 {
+		return modelID[:i]
+	}
+	return strings.TrimSuffix(modelID, ":cloud")
+}
+
+// TokenUsage is one response's billable token counts.
+//
+// Input is the provider-reported prompt size and therefore includes any portion
+// served from the prompt cache; Cached is that subset, not an addition to it.
+// Cache *writes* have no field in the genai usage metadata — providers report
+// the whole prompt under Input — so tokens that were freshly written to a cache
+// are indistinguishable here from ordinary fresh prompt tokens.
+type TokenUsage struct {
+	Input  int64
+	Output int64
+	Cached int64
+}
+
+// Fresh returns the prompt tokens that were not served from cache.
+func (u TokenUsage) Fresh() int64 {
+	fresh := u.Input - u.Cached
+	if fresh < 0 {
+		return 0
+	}
+	return fresh
+}
+
+// EstimateCostUSD prices one response's usage against a model's rates, in USD.
+//
+// Three rates apply, and the split matters: cached prompt tokens bill at the
+// cache-read rate (0.1x on Anthropic), everything else in the prompt at the
+// input rate, and generated tokens at the output rate. Charging cached reads at
+// the full input rate overstates a cached run by roughly an order of
+// magnitude, which is the difference between a budget that binds and one that
+// does not.
+//
+// Rates come from the tier the prompt size falls into, so a long agent
+// transcript crossing a 200k threshold prices the overflow at the higher rate
+// instead of pretending the whole request billed at the base rate.
+func EstimateCostUSD(pm PricingModel, u TokenUsage) float64 {
+	if u.Input < 0 {
+		u.Input = 0
+	}
+	if u.Output < 0 {
+		u.Output = 0
+	}
+	if u.Cached < 0 {
+		u.Cached = 0
+	}
+	cached := min(u.Cached, u.Input)
+
+	in, out, cacheRead := pm.rateFor(u.Input)
+	var cost float64
+	cost += perMillion(u.Input-cached, in)
+	cost += perMillion(cached, cacheRead)
+	cost += perMillion(u.Output, out)
+	return cost
+}
+
+// rateFor returns the tier that applies to a prompt of the given size: the
+// deepest tier whose threshold the prompt has crossed, or the model's base
+// rates when it is under every threshold.
+//
+// Tiers are not cumulative — a tier replaces the base rates outright — so the
+// answer is the last matching tier rather than a sum over the ones passed.
+func (p PricingModel) rateFor(promptTokens int64) (in, out, cacheRead float64) {
+	in, out, cacheRead = p.Input, p.Output, p.CacheRead
+	best := int64(-1)
+	for _, t := range p.Tiers {
+		if t.ContextOver <= promptTokens && t.ContextOver > best {
+			in, out, cacheRead = t.Input, t.Output, t.CacheRead
+			best = t.ContextOver
+		}
+	}
+	return in, out, cacheRead
+}
+
+// perMillion converts a token count at a per-million-token rate to USD.
+func perMillion(tokens int64, rate float64) float64 {
+	return float64(tokens) / 1_000_000 * rate
+}
+
 // ModelReleaseDate returns the models.dev release date for a model, or "" when
 // the provider or model is unknown. It uses the same prefix matching as CostFor.
 func ModelReleaseDate(providerName, modelName string) string {

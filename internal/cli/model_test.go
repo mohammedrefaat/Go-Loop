@@ -435,6 +435,8 @@ func TestModelPriceOllamaCloud(t *testing.T) {
 	}
 }
 
+// The key derivation moved to provider when the cost calculator needed it too,
+// so it is tested there; this asserts only that the CLI still routes through it.
 func TestOllamaCloudPriceKey(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"glm-5.3:cloud", "glm-5.3"},
@@ -444,8 +446,8 @@ func TestOllamaCloudPriceKey(t *testing.T) {
 		{"qwen3.5:397b", "qwen3.5:397b"}, // no cloud tag: untouched
 	}
 	for _, tt := range cases {
-		if got := ollamaCloudPriceKey(tt.in); got != tt.want {
-			t.Errorf("ollamaCloudPriceKey(%q) = %q, want %q", tt.in, got, tt.want)
+		if got := provider.OllamaCloudPriceKey(tt.in); got != tt.want {
+			t.Errorf("OllamaCloudPriceKey(%q) = %q, want %q", tt.in, got, tt.want)
 		}
 	}
 }

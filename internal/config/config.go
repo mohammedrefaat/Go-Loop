@@ -147,6 +147,36 @@ type Config struct {
 	// former must leave the agent auto-approving, which is pi-go's default
 	// behaviour and must not change just because this section was added.
 	Permissions *PermissionConfig `json:"permissions,omitempty"`
+
+	// Checkpoint configures turn-boundary checkpoints and /rewind. Nil means
+	// the defaults (100 per session, swept after 30 days); Enabled is false to
+	// turn the feature off, which stops the per-write snapshotting as well as
+	// the picker.
+	Checkpoint *CheckpointConfig `json:"checkpoint,omitempty"`
+}
+
+// CheckpointConfig holds the retention policy for turn checkpoints.
+//
+// Both fields are zero-means-default rather than pointer-means-default: neither
+// has a meaningful "unset" reading a user could want to distinguish from the
+// default, unlike the optional sections above.
+type CheckpointConfig struct {
+	// Enabled turns checkpointing on. Omitting this field entirely leaves the
+	// feature at its defaults, so an existing config file keeps working and
+	// keeps its checkpoints.
+	Enabled *bool `json:"enabled,omitempty"`
+	// Keep is how many checkpoints to retain per session. 0 = 100.
+	Keep int `json:"keep,omitempty"`
+	// CleanupPeriodDays is how old a checkpoint must be before the sweep removes
+	// it. 0 = 30 days.
+	CleanupPeriodDays int `json:"cleanupPeriodDays,omitempty"`
+}
+
+// CheckpointsEnabled reports whether checkpointing should run. A nil section
+// means enabled: the feature is on by default and the config only exists to
+// change the retention or to turn it off.
+func (c Config) CheckpointsEnabled() bool {
+	return c.Checkpoint == nil || c.Checkpoint.Enabled == nil || *c.Checkpoint.Enabled
 }
 
 // PermissionConfig holds the user's tool-permission rules and starting mode.

@@ -107,6 +107,7 @@ var slashCommandSpecs = []slashCommandSpec{
 	{name: "/context", desc: "Show context usage", run: slashCmdVoid((*model).showContextMessage)},
 	{name: "/branch", desc: "Manage branches", run: slashCmdArgs((*model).handleBranchCommand)},
 	{name: "/compact", desc: "Compact context", run: slashCmdVoid((*model).handleCompactCommand)},
+	{name: "/rewind", desc: "Restore code or conversation to an earlier turn (Esc Esc)", run: (*model).handleRewindCommand},
 	{name: "/subagents", desc: "Show subagents", run: slashCmdVoid((*model).handleAgentsCommand)},
 	{name: "/history", desc: "Command history", run: slashCmdArgs((*model).handleHistoryCommand)},
 	{name: "/login", desc: "Configure API keys (codex, openai, anthropic, gemini)", run: (*model).handleLoginCommand},
@@ -127,6 +128,9 @@ var slashCommandSpecs = []slashCommandSpec{
 	{name: "/skill-load", desc: "Reload skills from disk", hidden: true, run: slashCmdBare((*model).handleSkillLoadCommand)},
 	{name: "/skill-create", desc: "Create a new skill", hidden: true, run: (*model).handleSkillCreateCommand},
 	{name: "/theme", desc: "Switch theme or list themes", run: (*model).handleThemeCommand},
+	{name: "/import", desc: "Import configuration from Claude Code", run: (*model).handleImportClaudeCommand},
+	{name: "/keybindings", desc: "Show keybindings and their config file", run: (*model).handleKeybindingsCommand},
+	{name: "/doctor", desc: "Diagnose configuration, permissions, keybindings and skills", run: (*model).handleDoctorCommand},
 	{name: "/mouse", desc: "Toggle mouse capture (on/off)", run: (*model).handleMouseCommand},
 	{name: "/ping", desc: "Test LLM connectivity", run: (*model).handlePingCommand},
 	{name: "/model-price-refresh", desc: "Refresh model prices from models.dev", run: (*model).handleModelPriceRefreshCommand},
@@ -1066,6 +1070,14 @@ func (m *model) formatHelp() string {
 	b.WriteString("| `/rtk` | Output compaction stats |\n")
 	b.WriteString("| `/mcp` | List MCP servers and tool status |\n")
 	b.WriteString("| `/login <provider>` | Configure API keys |\n")
+
+	b.WriteString("\n**Diagnostics:**\n\n")
+	b.WriteString("| Command | Description |\n")
+	b.WriteString("|---------|-------------|\n")
+	b.WriteString("| `/doctor` | Diagnose config, permissions, keybindings, skills, tooling |\n")
+	b.WriteString("| `/ping` | Test provider connectivity |\n")
+	b.WriteString("| `/keybindings [context]` | Show keybindings and their config file |\n")
+	b.WriteString("| `/import claude` | Import configuration from Claude Code |\n")
 
 	b.WriteString("\n**Skills:**\n\n")
 	b.WriteString("| Command | Description |\n")

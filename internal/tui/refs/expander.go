@@ -345,3 +345,37 @@ func Truncate(content string, maxLines int) (string, bool) {
 	}
 	return strings.Join(lines[:maxLines], "\n"), true
 }
+
+
+type FileExpansion struct {
+	Content string
+	Warning string
+}
+
+func (e *Expander) ExpandFile(ref ParsedRef) (FileExpansion, error) {
+	var content, warning string
+	switch ref.Type {
+	case RefFolder:
+		content, warning = e.expandFolder(ref)
+	default:
+		content, warning = e.expandFile(ref)
+	}
+	if warning != "" {
+		return FileExpansion{Warning: warning}, nil
+	}
+	return FileExpansion{Content: content}, nil
+}
+
+func (e *Expander) ExpandFileNoSandboxCheck(ref ParsedRef) (FileExpansion, error) {
+	var content, warning string
+	switch ref.Type {
+	case RefFolder:
+		content, warning = e.expandFolder(ref)
+	default:
+		content, warning = e.expandFile(ref)
+	}
+	if warning != "" {
+		return FileExpansion{Warning: warning}, nil
+	}
+	return FileExpansion{Content: content}, nil
+}

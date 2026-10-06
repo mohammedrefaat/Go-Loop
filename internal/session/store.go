@@ -1256,6 +1256,87 @@ func (s *FileService) ClearEvents(sessionID, appName, userID string) error {
 	return nil
 }
 
+// TruncateEvents drops every event after the first `keep`, so the conversation
+// ends where a checkpoint says it did. It is what /rewind's conversation restore
+// needs: ClearEvents empties the session outright, and nothing here has ever
+// been able to cut one back to a middle point.
+//
+// The three updates are one operation and all three are required. The in-memory
+// slice is what Get and AppendEvent read; rewriteEvents is what the next
+// process to open the session sees; and the ATIF writer is replaced because its
+// numbering continues over a trajectory that no longer exists. Skipping the
+// first leaves the rewind invisible until the process restarts, and skipping the
+// third leaves the trajectory describing turns that were just discarded.
+//
+// keep is clamped to the events actually present: a checkpoint taken before a
+// /clear, or one from a session whose events were compacted away, names an
+// index past the end, and truncating to it must not panic.
+func (s *FileService) TruncateEvents(sessionID, appName, userID string, keep int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, err := s.loadSession(sessionID, appName, userID)
+	if err != nil {
+		return fmt.Errorf("loading session for truncate: %w", err)
+	}
+
+	if keep < 0 {
+		keep = 0
+	}
+	if keep > len(sess.events) {
+		keep = len(sess.events)
+	}
+	if keep == len(sess.events) {
+		return nil // already at or before the boundary; nothing to drop
+	}
+
+	sess.events = sess.events[:keep]
+
+	sessionDir := filepath.Join(s.baseDir, sessionID)
+	if err := rewriteEvents(sessionDir, sess.events); err != nil {
+		return fmt.Errorf("rewriting events after truncate: %w", err)
+	}
+
+	sess.atifWriter = atif.NewWriter(
+		filepath.Join(sessionDir, "trajectory.atif.json"),
+		atif.SessionMeta{
+			SessionID: sessionID,
+			AgentName: sess.meta.AppName,
+			Model:     sess.meta.Model,
+			WorkDir:   sess.meta.WorkDir,
+		},
+	)
+
+	// AppendEvent advances the active branch's head on every append, so a head
+	// pointing past the new end would make the next /branch list report a fork
+	// point that is not in the session.
+	bs, err := loadBranches(sessionDir)
+	if err == nil {
+		if branch, ok := bs.Branches[bs.Active]; ok {
+			branch.Head = keep - 1
+			bs.Branches[bs.Active] = branch
+			_ = saveBranches(sessionDir, bs) // best-effort, as in AppendEvent
+		}
+	}
+
+	return nil
+}
+
+// EventCount returns how many events a session currently holds, which is the
+// index a checkpoint taken before the next prompt should record.
+func (s *FileService) EventCount(sessionID, appName, userID string) (int, error) {
+	// A full Lock, not RLock: loadSession populates the LRU cache on a miss, so
+	// this is a write to the service whenever the session is not already open.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	sess, err := s.loadSession(sessionID, appName, userID)
+	if err != nil {
+		return 0, fmt.Errorf("loading session for event count: %w", err)
+	}
+	return len(sess.events), nil
+}
+
 // EstimateTokens returns an approximate token count for a session's events.
 // Uses a simple chars/4 heuristic.
 func (s *FileService) EstimateTokens(sessionID, appName, userID string) (int, error) {

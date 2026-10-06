@@ -297,7 +297,7 @@ func TestRunPrintContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := runPrint(ctx, ag, sessionID, "hello", nil)
+	err := runPrint(ctx, ag, sessionID, "hello", nil, nil)
 	if err != nil {
 		t.Fatalf("runPrint with canceled context returned error: %v", err)
 	}
@@ -313,7 +313,7 @@ func TestRunJSONContextCancelled(t *testing.T) {
 	cancel()
 
 	stdout := captureStdout(t, func() {
-		err := runJSON(ctx, ag, sessionID, "hello", nil)
+		err := runJSON(ctx, ag, sessionID, "hello", nil, nil)
 		if err != nil {
 			t.Errorf("runJSON with canceled context returned error: %v", err)
 		}
@@ -337,7 +337,7 @@ func TestRunPrintThinkingOutput(t *testing.T) {
 	var stdout, stderr string
 	stderr = captureStderr(t, func() {
 		stdout = captureStdout(t, func() {
-			if err := runPrint(context.Background(), ag, sessionID, "think about it", nil); err != nil {
+			if err := runPrint(context.Background(), ag, sessionID, "think about it", nil, nil); err != nil {
 				t.Errorf("runPrint error: %v", err)
 			}
 		})

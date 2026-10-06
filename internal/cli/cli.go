@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 	"log/slog"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/dimetron/pi-go/internal/agent"
 	"github.com/dimetron/pi-go/internal/autocompact"
+	"github.com/dimetron/pi-go/internal/budget"
 	"github.com/dimetron/pi-go/internal/config"
 	"github.com/dimetron/pi-go/internal/ctxwindow"
 	"github.com/dimetron/pi-go/internal/extension"
@@ -36,6 +38,7 @@ import (
 	"github.com/dimetron/pi-go/internal/lsp"
 	"github.com/dimetron/pi-go/internal/memory"
 	"github.com/dimetron/pi-go/internal/otel"
+	"github.com/dimetron/pi-go/internal/outputstyle"
 	"github.com/dimetron/pi-go/internal/palace"
 	"github.com/dimetron/pi-go/internal/permission"
 	"github.com/dimetron/pi-go/internal/pirpc"
@@ -73,6 +76,8 @@ var (
 	flagNoMouse      bool
 	flagLSP          string
 	flagSystem       string
+	flagOutputStyle  string
+	flagSkillTouched []string
 	flagPprof        string
 	flagPprofPort    string
 	flagMetrics      bool
@@ -81,6 +86,14 @@ var (
 	flagTraceHTTP    bool
 	flagA2AAddr      string
 	flagA2AReadyAddr string
+
+	// Headless run ceilings. Both are zero when unset, which the budget package
+	// reads as "no limit" — the same as omitting the flags entirely.
+	flagMaxTurns     int
+	flagMaxBudgetUSD float64
+	// flagOutputFormat selects the JSON dialect. "" keeps pi-go's own JSONL;
+	// "stream-json" adds the per-turn accounting a CI harness reads.
+	flagOutputFormat string
 
 	// lastSessionFile persists the last session start metadata across invocations.
 	// Used to detect rapid restart loops (e.g. print mode crashes).
@@ -204,6 +217,8 @@ Set a default in ~/.pi-go/config.json so --model is only needed to deviate;
 
 	cmd.Flags().StringVar(&flagModel, "model", "", "LLM model to use (e.g. claude-sonnet-5, gpt-5.2, gemini-3.5-pro, ollama/gemma4:e4b, minimax-m3:cloud)")
 	cmd.Flags().StringVar(&flagMode, "mode", "", "Output mode: interactive, print, json, socket, rpc")
+	cmd.Flags().StringVar(&flagOutputFormat, "output-format", "",
+		"JSON event dialect for --mode json: pi (default) or stream-json (adds turn and cost accounting)")
 	cmd.Flags().StringVar(&flagSocket, "socket", "/tmp/pi-go.sock", "Unix socket path for socket mode")
 	// pi-acp unconditionally spawns `pi --mode rpc --no-themes`. pi-go has no
 	// themes to disable, but rejecting the flag kills the child on spawn and
@@ -217,12 +232,20 @@ Set a default in ~/.pi-go/config.json so --model is only needed to deviate;
 	cmd.Flags().BoolVar(&flagSlow, "slow", false, "Use the slow role (powerful model)")
 	cmd.Flags().BoolVar(&flagPlan, "plan", false, "Use the plan role (planning model)")
 	cmd.Flags().StringVar(&flagSystem, "system", "", "System instruction (overrides default)")
+	cmd.Flags().StringVar(&flagOutputStyle, "output-style", "",
+		"Output style to shape the response (built-in: terse, deep, plan; or a name from ~/.pi-go/output-styles)")
+	cmd.Flags().StringArrayVar(&flagSkillTouched, "skill-touched", nil,
+		"Path the session has already touched, for `paths:`-gated skills (repeatable)")
 	cmd.Flags().StringArrayVar(&flagHeaders, "header", nil, "Extra HTTP header for LLM requests (key=value, repeatable)")
 	// Allow bare --header so a following flag is not consumed as a header value.
 	if f := cmd.Flags().Lookup("header"); f != nil {
 		f.NoOptDefVal = ""
 	}
 	cmd.Flags().BoolVar(&flagInsecure, "insecure", false, "Skip TLS certificate verification for LLM API calls")
+	cmd.Flags().IntVar(&flagMaxTurns, "max-turns", 0,
+		"Stop a headless run after this many model round-trips (0 = unlimited)")
+	cmd.Flags().Float64Var(&flagMaxBudgetUSD, "max-budget-usd", 0,
+		"Stop a headless run once its estimated cost reaches this many US dollars (0 = unlimited)")
 	cmd.Flags().StringVar(&flagCACert, "ca-cert", "", "PEM bundle to trust for LLM API calls, in addition to the system roots")
 	cmd.Flags().BoolVar(&flagMemoryOff, "memory-off", false, "Disable the persistent memory system for this session")
 	cmd.Flags().BoolVar(&flagNoMouse, "no-mouse", false, "Disable mouse capture in the TUI (enables native terminal text selection)")
@@ -291,6 +314,23 @@ type rootRuntime struct {
 	cwd          string
 	sandboxRoot  string
 	worktreeDir  string
+	// limits is the headless run's turn and cost ceilings. One instance per
+	// invocation, shared by the model wrapper that spends and the event stream
+	// that counts — neither alone can enforce both.
+	limits *budget.Limits
+}
+
+// headlessLimits returns the run's ceilings, or nil when neither flag was set.
+//
+// Nil rather than an unlimited Limits so the model wrapper and the turn counter
+// both take their no-op path — the difference is a handful of string
+// comparisons per response against wrapping every response in a struct nobody
+// reads.
+func headlessLimits() *budget.Limits {
+	if flagMaxTurns <= 0 && flagMaxBudgetUSD <= 0 {
+		return nil
+	}
+	return budget.New(flagMaxTurns, flagMaxBudgetUSD)
 }
 
 func resolveActiveRole() string {
@@ -304,6 +344,69 @@ func resolveActiveRole() string {
 		activeRole = "plan"
 	}
 	return activeRole
+}
+
+// resolveOutputStyle decides which output style applies, and reports a
+// non-fatal problem rather than failing the run: a mistyped --output-style
+// should not stop someone from working, and the prompt is still correct
+// without one.
+//
+// A user style in ~/.pi-go/output-styles wins over a built-in of the same
+// name, so a built-in can be overridden without editing the binary.
+func resolveOutputStyle() (outputstyle.Selection, string) {
+	sel := outputstyle.Selection{Explicit: strings.TrimSpace(flagOutputStyle)}
+	sel.Role = outputstyle.RoleStyleFor(resolveActiveRole())
+
+	if sel.Explicit == "" {
+		return sel, ""
+	}
+	// Same order as loadOutputStyle: a user style of a built-in's name is
+	// real, so checking the built-in first would declare it missing.
+	if dir, err := outputstyle.Dir(); err == nil {
+		if _, err := outputstyle.Load(dir, sel.Explicit); err == nil {
+			return sel, ""
+		}
+	}
+	if _, err := outputstyle.LoadBuiltin(sel.Explicit); err == nil {
+		return sel, ""
+	}
+	return sel, fmt.Sprintf("unknown output style %q; using the default style. "+
+		"Built-in styles: terse, deep, plan. Custom styles go in %s.",
+		sel.Explicit, filepath.Join(homeOrDot(), ".pi-go", "output-styles"))
+}
+
+// loadOutputStyle returns the style text to prepend, and a notice when the
+// requested style could not be loaded.
+func loadOutputStyle() (string, string) {
+	sel, warn := resolveOutputStyle()
+	name := sel.Name()
+	if name == "" {
+		return "", warn
+	}
+	// User directory first, built-in second: a user must be able to retune a
+	// shipped style without patching the binary. The reverse order would make
+	// every built-in name un-overridable, since those names always resolve.
+	var style outputstyle.Style
+	var err error
+	if dir, dirErr := outputstyle.Dir(); dirErr == nil {
+		style, err = outputstyle.Load(dir, name)
+	}
+	if err != nil {
+		style, err = outputstyle.LoadBuiltin(name)
+	}
+	if err != nil {
+		return "", warn
+	}
+	return style.Prompt(), warn
+}
+
+// homeOrDot returns the user's home directory, or "." when it cannot be
+// resolved, so a diagnostic path is still readable rather than truncated.
+func homeOrDot() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return home
+	}
+	return "."
 }
 
 func resolveMode() string {
@@ -477,6 +580,13 @@ func buildRootRuntime(ctx context.Context, args []string) (rootRuntime, error) {
 	tokenTracker := guardrail.New(cfg.MaxDailyTokens)
 	tokenTracker.SetContextWindowSize(ctxwindow.Resolve(ctx, cfg, info, baseURL))
 	llm = guardrail.WrapModel(llm, tokenTracker)
+	// After the tracker wrapper, so cost is charged once per response rather
+	// than twice. Interactive sessions are bounded by the daily token limit
+	// instead: a run that is already stopped is one nobody asked to cap.
+	limits := headlessLimits()
+	if limits != nil && !isInteractiveMode(mode) {
+		llm = guardrail.WrapBudgetedModel(llm, limits, info.Provider, llm.Name())
+	}
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -502,7 +612,20 @@ func buildRootRuntime(ctx context.Context, args []string) (rootRuntime, error) {
 		cwd:          cwd,
 		sandboxRoot:  sandboxRoot,
 		worktreeDir:  worktreeDir,
+		limits:       limits,
 	}, nil
+}
+
+// isInteractiveMode reports whether a mode is the TUI or one of the servers
+// that host a client. Budgets apply to one-shot runs; a long-lived session
+// would sit at its ceiling doing nothing, which is not what a ceiling is for.
+func isInteractiveMode(mode string) bool {
+	switch mode {
+	case "interactive", "socket", "rpc":
+		return true
+	default:
+		return false
+	}
 }
 
 // pprofOnce guards the pprof listener. PersistentPreRun fires once per command,
@@ -668,6 +791,7 @@ func runRoot(cmd *cobra.Command, args []string) error {
 		runtime.worktreeDir,
 		runtime.mode,
 		runtime.prompt,
+		runtime.limits,
 	)
 }
 
@@ -792,6 +916,7 @@ func runNonInteractive(
 	info provider.Info,
 	tokenTracker *guardrail.Tracker,
 	cwd, sandboxRoot, worktreeDir, mode, prompt string,
+	limits *budget.Limits,
 ) error {
 	runtime, err := initNonInteractiveRuntime(parentCtx, &cfg, cwd, sandboxRoot, worktreeDir)
 	if err != nil {
@@ -934,7 +1059,7 @@ func runNonInteractive(
 	armMemoryObservationSession(ctx, memStore, sessionID, cwd, &memSessionID)
 
 	sessionLog.SessionStart(sessionID, llm.Name(), info.Provider, provider.BackendName(info, config.APIKeys()[info.Provider], info.BaseURL), info.BaseURL, mode)
-	return dispatchMode(ctx, mode, prompt, ag, sessionID, sessionLog, llm.Name(), cfg, tokenTracker)
+	return dispatchMode(ctx, mode, prompt, ag, sessionID, sessionLog, llm.Name(), cfg, tokenTracker, limits)
 }
 
 // appendNonInteractiveMemoryTools adds the memory tools when a store is
@@ -1160,7 +1285,7 @@ func resolveSessionID(ctx context.Context, ag *agent.Agent, sessionSvc *pisessio
 //     integration. This was spelled "rpc" before the rename.
 //   - "rpc": the stdio NDJSON protocol that `pi-acp` drives, wire-compatible
 //     with upstream pi's `--mode rpc`.
-func dispatchMode(ctx context.Context, mode, prompt string, ag *agent.Agent, sessionID string, sessionLog *logger.Logger, modelName string, cfg config.Config, tokenTracker *guardrail.Tracker) error {
+func dispatchMode(ctx context.Context, mode, prompt string, ag *agent.Agent, sessionID string, sessionLog *logger.Logger, modelName string, cfg config.Config, tokenTracker *guardrail.Tracker, limits *budget.Limits) error {
 	// Pre-rename spelling: `--mode rpc --socket <path>` meant the Unix socket
 	// server. Honor it with a warning rather than silently starting the
 	// stdio server and leaving the caller's socket client hanging.
@@ -1206,9 +1331,9 @@ func dispatchMode(ctx context.Context, mode, prompt string, ag *agent.Agent, ses
 		return nil
 	}
 	if mode == "json" {
-		return runJSON(ctx, ag, sessionID, prompt, sessionLog)
+		return runJSON(ctx, ag, sessionID, prompt, sessionLog, limits)
 	}
-	return runPrint(ctx, ag, sessionID, prompt, sessionLog)
+	return runPrint(ctx, ag, sessionID, prompt, sessionLog, limits)
 }
 
 // memoryEnabled reports whether the observation memory subsystem is on.
@@ -1629,7 +1754,12 @@ func formatPrintSkillLoad(count int, err error) string {
 
 // runPrint runs the agent and prints text responses to stdout.
 // Tool calls are shown as status lines on stderr.
-func runPrint(ctx context.Context, ag *agent.Agent, sessionID, prompt string, log *logger.Logger) error {
+//
+// limits may be nil, which enforces nothing. A run that reaches a ceiling
+// returns a *budget.Stopped, so the exit code is non-zero and the reason is on
+// stderr — a cap that exited 0 would be invisible to every caller that checks
+// status rather than reading output.
+func runPrint(ctx context.Context, ag *agent.Agent, sessionID, prompt string, log *logger.Logger, limits *budget.Limits) error {
 	ctx, span := otel.Tracer("pi-go").Start(ctx, "agent.prompt")
 	defer span.End()
 	span.SetAttributes(otel.AttributeInt("prompt.length", len(prompt)))
@@ -1655,7 +1785,7 @@ func runPrint(ctx context.Context, ag *agent.Agent, sessionID, prompt string, lo
 	// without this the whole answer prints twice.
 	var dedup agent.StreamDedup
 	for ev, err := range agent.WithRetryContext(ctx, retryCfg, func() iter.Seq2[*session.Event, error] {
-		return ag.RunStreaming(ctx, sessionID, prompt)
+		return agent.LimitTurns(ag.RunStreaming(ctx, sessionID, prompt), limits)
 	}) {
 		if err != nil {
 			if ctx.Err() != nil {
@@ -1682,6 +1812,13 @@ func runPrint(ctx context.Context, ag *agent.Agent, sessionID, prompt string, lo
 		printEventParts(ev, &dedup, log)
 	}
 	fmt.Println()
+	// Checked after the range, not inside it: a budget stop ends the sequence
+	// without an error, so the loop has no other way to notice it happened.
+	if stop := limits.Exceeded(); stop != nil {
+		fmt.Fprintf(os.Stderr, "pi-go: %s\n", stop.Error())
+		log.Error(stop.Error())
+		return stop
+	}
 	return nil
 }
 
@@ -1739,6 +1876,11 @@ func printEventParts(ev *session.Event, dedup *agent.StreamDedup, log *logger.Lo
 
 // jsonEvent represents a JSONL event for JSON output mode.
 // Event types follow the spec: message_start, text_delta, tool_call, tool_result, message_end.
+//
+// The accounting fields are emitted only under --output-format stream-json, so
+// the default dialect stays byte-identical to what it was before the flag
+// existed. Every one of them is omitempty, which is what keeps a `json` field
+// from appearing on a text_delta.
 type jsonEvent struct {
 	Type      string `json:"type"`
 	Agent     string `json:"agent,omitempty"`
@@ -1749,11 +1891,73 @@ type jsonEvent struct {
 	ToolInput any    `json:"tool_input,omitempty"`
 	SessionID string `json:"session_id,omitempty"`
 	Error     string `json:"error,omitempty"`
+
+	// --- stream-json accounting ---
+
+	// Subtype qualifies Type: "init", "success", "error_max_turns",
+	// "error_max_budget", "error_during_execution".
+	Subtype string `json:"subtype,omitempty"`
+	// Model names the model the run resolved to, on the init event.
+	Model string `json:"model,omitempty"`
+	// Turn is the 1-based model round-trip number.
+	Turn int `json:"turn,omitempty"`
+	// NumTurns and DurationMS are totals, on the result event.
+	NumTurns   int   `json:"num_turns,omitempty"`
+	DurationMS int64 `json:"duration_ms,omitempty"`
+	// TotalCostUSD is the estimated cost. Present only when the model could be
+	// priced — a run against a model absent from the pricing snapshot reports
+	// 0 and cost_known false rather than implying it was free.
+	TotalCostUSD float64 `json:"total_cost_usd,omitempty"`
+	CostKnown    bool    `json:"cost_known,omitempty"`
+	// Result is the assembled reply text, on the result event.
+	Result string `json:"result,omitempty"`
+	// Usage is the run's token totals, on the result event. It is a pointer
+	// because omitempty does not apply to a struct value: a plain jsonUsage
+	// field would marshal as an all-zero object on every event in every
+	// dialect, which is the one thing the default dialect must not do.
+	Usage *jsonUsage `json:"usage,omitempty"`
+}
+
+// jsonUsage is the token accounting a CI harness bills against.
+type jsonUsage struct {
+	InputTokens         int64 `json:"input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_input_tokens"`
+	CacheCreationTokens int64 `json:"cache_creation_input_tokens"`
+}
+
+// jsonDialect is the value of --output-format. The empty string and "pi" are the
+// same dialect; "stream-json" adds run accounting.
+type jsonDialect int
+
+const (
+	jsonPi jsonDialect = iota
+	jsonStream
+)
+
+// resolveJSONDialect validates --output-format. An unknown value is a hard
+// error rather than a warning: a CI job that asked for stream-json and got the
+// other dialect would fail in a way that looks like the agent misbehaved.
+func resolveJSONDialect() (jsonDialect, error) {
+	switch name := strings.TrimSpace(flagOutputFormat); name {
+	case "", "pi":
+		return jsonPi, nil
+	case "stream-json":
+		return jsonStream, nil
+	default:
+		return jsonPi, fmt.Errorf("unknown --output-format %q: use pi or stream-json", name)
+	}
 }
 
 // runJSON runs the agent and emits JSONL events to stdout.
 // Events: message_start (once), text_delta (per text chunk), tool_call, tool_result, message_end (once).
-func runJSON(ctx context.Context, ag *agent.Agent, sessionID, prompt string, log *logger.Logger) error {
+//
+// limits may be nil, which enforces nothing.
+func runJSON(ctx context.Context, ag *agent.Agent, sessionID, prompt string, log *logger.Logger, limits *budget.Limits) error {
+	dialect, err := resolveJSONDialect()
+	if err != nil {
+		return err
+	}
 	log.UserMessage(prompt)
 	// Auto-set the session title for JSON mode too. The first jsonEvent
 	// carries session_id, so the title is just metadata to keep meta.json
@@ -1767,16 +1971,30 @@ func runJSON(ctx context.Context, ag *agent.Agent, sessionID, prompt string, log
 	// without this every text_delta is emitted twice.
 	var dedup agent.StreamDedup
 
+	run := &jsonRun{
+		sessionID:  sessionID,
+		started:    time.Now(),
+		limits:     limits,
+		dialect:    dialect,
+		enc:        enc,
+		modelName:  ag.ModelName(),
+		lastTurn:   0,
+		streamDone: false,
+	}
+	run.emitInit()
+
 	retryCfg := agent.DefaultRetryConfig()
 	for ev, err := range agent.WithRetryContext(ctx, retryCfg, func() iter.Seq2[*session.Event, error] {
-		return ag.RunStreaming(ctx, sessionID, prompt)
+		return agent.LimitTurns(ag.RunStreaming(ctx, sessionID, prompt), limits)
 	}) {
 		if err != nil {
 			if ctx.Err() != nil {
 				_ = enc.Encode(jsonEvent{Type: "message_end"})
+				run.emitResult("interrupted", true)
 				return nil
 			}
 			log.Error(err.Error())
+			run.emitResult("error_during_execution", true)
 			return fmt.Errorf("agent run: %w", err)
 		}
 		if ev == nil {
@@ -1787,6 +2005,7 @@ func runJSON(ctx context.Context, ag *agent.Agent, sessionID, prompt string, log
 		if evErr := agent.EventError(ev); evErr != nil {
 			log.Error(evErr.Error())
 			_ = enc.Encode(jsonEvent{Type: "error", Agent: ev.Author, Error: evErr.Error()})
+			run.emitResult("error_during_execution", true)
 			return fmt.Errorf("agent run: %w", evErr)
 		}
 		if ev.Content == nil {
@@ -1805,7 +2024,7 @@ func runJSON(ctx context.Context, ag *agent.Agent, sessionID, prompt string, log
 		}
 
 		dedup.BeginEvent(ev)
-		encodeEventParts(enc, ev, &dedup, log)
+		run.encodeParts(ev, &dedup, log)
 	}
 	if !started {
 		const warn = "pi-go: warning: no assistant events received before message_end"
@@ -1813,16 +2032,103 @@ func runJSON(ctx context.Context, ag *agent.Agent, sessionID, prompt string, log
 		log.Error(warn)
 	}
 	_ = enc.Encode(jsonEvent{Type: "message_end"})
+
+	// After the range, because a budget stop ends the sequence silently.
+	if stop := limits.Exceeded(); stop != nil {
+		log.Error(stop.Error())
+		run.emitResult(budgetSubtype(stop), true)
+		return stop
+	}
+	run.emitResult("success", false)
 	return nil
 }
 
-// encodeEventParts emits one event's parts as JSONL: thinking_delta,
-// text_delta, tool_call and tool_result. The caller must have called
-// dedup.BeginEvent for ev.
-func encodeEventParts(enc *json.Encoder, ev *session.Event, dedup *agent.StreamDedup, log *logger.Logger) {
+// budgetSubtype names which ceiling bound a stopped run, for the stream-json
+// result event. A consumer branches on this rather than parsing the message.
+func budgetSubtype(stop error) string {
+	if errors.Is(stop, budget.MaxTurnsErr) {
+		return "error_max_turns"
+	}
+	return "error_max_budget"
+}
+
+// jsonRun carries the run-wide state stream-json needs: the assembled reply,
+// the turn counter, and the token totals. The `pi` dialect touches none of it,
+// which is why these fields cost nothing there.
+type jsonRun struct {
+	sessionID string
+	modelName string
+	started   time.Time
+	limits    *budget.Limits
+	dialect   jsonDialect
+	enc       *json.Encoder
+
+	// reply accumulates emitted text so the result event can carry the whole
+	// answer, not just its last delta.
+	reply strings.Builder
+	// tokens accumulates the run's usage. ADK reports usage per event rather
+	// than per run, and every round-trip re-reports the whole conversation's
+	// prompt, so these are summed — see recordUsage for why an aggregate is
+	// taken instead.
+	tokens jsonUsage
+	// lastTurn is the turn number most recently reported, so each turn is
+	// announced exactly once no matter how many events it spans.
+	lastTurn   int
+	streamDone bool
+}
+
+// accounting reports whether the running dialect carries run accounting.
+func (r *jsonRun) accounting() bool { return r.dialect == jsonStream }
+
+// recordUsage folds one event's usage metadata into the run's totals.
+//
+// Only the aggregate of each round-trip is counted — the same non-partial
+// qualifier the turn counter uses. An SSE stream repeats the same usage on
+// every chunk, and the last chunk of a round-trip carries the full figure, so
+// summing the aggregate alone gives the round-trip's true cost. Summing the
+// partials as well would multiply the prompt count by the chunk count.
+func (r *jsonRun) recordUsage(ev *session.Event) {
+	if !r.accounting() || ev == nil || ev.Partial {
+		return
+	}
+	u := ev.UsageMetadata
+	if u == nil {
+		return
+	}
+	r.tokens.InputTokens += int64(u.PromptTokenCount)
+	r.tokens.OutputTokens += int64(u.CandidatesTokenCount)
+	r.tokens.CacheReadTokens += int64(u.CachedContentTokenCount)
+}
+
+// tokenTotals returns a copy, so the run's accumulator cannot be aliased into a
+// value already handed to the encoder.
+func (r *jsonRun) tokenTotals() *jsonUsage {
+	t := r.tokens
+	return &t
+}
+
+// emitInit writes the opening stream-json event. A no-op in the `pi` dialect,
+// where message_start already carries the session.
+func (r *jsonRun) emitInit() {
+	if !r.accounting() {
+		return
+	}
+	_ = r.enc.Encode(jsonEvent{
+		Type:      "system",
+		Subtype:   "init",
+		SessionID: r.sessionID,
+		Model:     r.modelName,
+	})
+}
+
+// encodeParts emits one event's parts as JSONL: thinking_delta, text_delta,
+// tool_call and tool_result. The caller must have called dedup.BeginEvent for
+// ev.
+func (r *jsonRun) encodeParts(ev *session.Event, dedup *agent.StreamDedup, log *logger.Logger) {
+	r.recordUsage(ev)
 	for _, part := range ev.Content.Parts {
 		if part.Text != "" && ev.Content.Role == "thinking" {
-			_ = enc.Encode(jsonEvent{
+			_ = r.enc.Encode(jsonEvent{
 				Type:  "thinking_delta",
 				Agent: ev.Author,
 				Delta: part.Text,
@@ -1834,15 +2140,16 @@ func encodeEventParts(enc *json.Encoder, ev *session.Event, dedup *agent.StreamD
 			if dedup.SkipText(ev) {
 				continue
 			}
-			_ = enc.Encode(jsonEvent{
+			_ = r.enc.Encode(jsonEvent{
 				Type:  "text_delta",
 				Agent: ev.Author,
 				Delta: part.Text,
 			})
+			r.reply.WriteString(part.Text)
 			log.LLMText(ev.Author, part.Text)
 		}
 		if part.FunctionCall != nil {
-			_ = enc.Encode(jsonEvent{
+			_ = r.enc.Encode(jsonEvent{
 				Type:      "tool_call",
 				Agent:     ev.Author,
 				ToolName:  part.FunctionCall.Name,
@@ -1855,7 +2162,7 @@ func encodeEventParts(enc *json.Encoder, ev *session.Event, dedup *agent.StreamD
 			if err != nil {
 				respJSON = []byte(fmt.Sprintf("%v", part.FunctionResponse.Response))
 			}
-			_ = enc.Encode(jsonEvent{
+			_ = r.enc.Encode(jsonEvent{
 				Type:     "tool_result",
 				Agent:    ev.Author,
 				ToolName: part.FunctionResponse.Name,
@@ -1864,6 +2171,72 @@ func encodeEventParts(enc *json.Encoder, ev *session.Event, dedup *agent.StreamD
 			log.ToolResult(ev.Author, part.FunctionResponse.Name, string(respJSON))
 		}
 	}
+	r.announceTurn(ev)
+}
+
+// announceTurn emits a `turn` event the first time each model round-trip is
+// seen. The number comes from limits, so it is the same count the turn ceiling
+// enforces rather than a second tally that could disagree with it; a run with
+// no ceiling still counts, because Limits records turns unconditionally.
+func (r *jsonRun) announceTurn(ev *session.Event) {
+	if !r.accounting() || r.streamDone {
+		return
+	}
+	if r.limits == nil {
+		return
+	}
+	n := r.limits.Turns()
+	if n <= 0 || n == r.lastTurn {
+		return
+	}
+	r.lastTurn = n
+	spent, priced := r.limits.SpentUSD()
+	_ = r.enc.Encode(jsonEvent{
+		Type:         "turn",
+		Turn:         n,
+		TotalCostUSD: spent,
+		CostKnown:    priced,
+	})
+}
+
+// emitResult writes the closing stream-json event, carrying the totals a CI
+// harness bills against. It fires at most once: a run that reports a provider
+// failure returns immediately after, and a second result would tell the
+// consumer two things about how it ended.
+//
+// A no-op in the `pi` dialect, which already ends with message_end.
+func (r *jsonRun) emitResult(subtype string, isError bool) {
+	if !r.accounting() || r.streamDone {
+		return
+	}
+	r.streamDone = true
+	spent, priced := 0.0, false
+	turns := 0
+	usage := &jsonUsage{}
+	if r.limits != nil {
+		spent, priced = r.limits.SpentUSD()
+		turns = r.limits.Turns()
+		usage = r.tokenTotals()
+	}
+	ev := jsonEvent{
+		Type:         "result",
+		Subtype:      subtype,
+		SessionID:    r.sessionID,
+		Model:        r.modelName,
+		Turn:         turns,
+		NumTurns:     turns,
+		DurationMS:   time.Since(r.started).Milliseconds(),
+		TotalCostUSD: spent,
+		CostKnown:    priced,
+		Result:       r.reply.String(),
+		Usage:        usage,
+	}
+	if isError {
+		// The only field that distinguishes a stop from a success. A consumer
+		// that ignores it would treat a run cut off at turn 5 as complete.
+		ev.Error = subtype
+	}
+	_ = r.enc.Encode(ev)
 }
 
 // buildCommitMsgFunc creates the GenerateCommitMsg callback for /commit.

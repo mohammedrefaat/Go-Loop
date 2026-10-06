@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"google.golang.org/adk/v2/session"
 	adktool "google.golang.org/adk/v2/tool"
@@ -734,6 +735,15 @@ func TestPrintGroundingEvent(t *testing.T) {
 	})
 }
 
+// newJSONTestRun builds a jsonRun over an in-memory buffer in the default
+// dialect, so a test can exercise the part encoder without a live run.
+func newJSONTestRun(buf *bytes.Buffer) *jsonRun {
+	return &jsonRun{
+		enc:     json.NewEncoder(buf),
+		started: time.Now(),
+	}
+}
+
 func TestEncodeEventParts(t *testing.T) {
 	ev := modelEvent(
 		&genai.Part{Text: "hello"},
@@ -744,7 +754,7 @@ func TestEncodeEventParts(t *testing.T) {
 	var buf bytes.Buffer
 	var dedup agent.StreamDedup
 	dedup.BeginEvent(ev)
-	encodeEventParts(json.NewEncoder(&buf), ev, &dedup, nil)
+	newJSONTestRun(&buf).encodeParts(ev, &dedup, nil)
 
 	var gotTypes []string
 	for _, line := range strings.Split(strings.TrimSpace(buf.String()), "\n") {
@@ -768,7 +778,7 @@ func TestEncodeEventPartsThinkingAndDedup(t *testing.T) {
 	var buf bytes.Buffer
 	var dedup agent.StreamDedup
 	dedup.BeginEvent(thinking)
-	encodeEventParts(json.NewEncoder(&buf), thinking, &dedup, nil)
+	newJSONTestRun(&buf).encodeParts(thinking, &dedup, nil)
 	if !strings.Contains(buf.String(), `"thinking_delta"`) {
 		t.Errorf("output = %q, want a thinking_delta event", buf.String())
 	}
@@ -778,11 +788,11 @@ func TestEncodeEventPartsThinkingAndDedup(t *testing.T) {
 	aggregate := modelEvent(&genai.Part{Text: "hi"})
 
 	buf.Reset()
-	enc := json.NewEncoder(&buf)
+	run := newJSONTestRun(&buf)
 	var d2 agent.StreamDedup
 	for _, ev := range []*session.Event{delta, aggregate} {
 		d2.BeginEvent(ev)
-		encodeEventParts(enc, ev, &d2, nil)
+		run.encodeParts(ev, &d2, nil)
 	}
 	if n := strings.Count(buf.String(), `"text_delta"`); n != 1 {
 		t.Errorf("text_delta count = %d, want 1 (aggregate re-send suppressed)", n)
@@ -925,6 +935,28 @@ func TestBuildDeferredInstructionParts(t *testing.T) {
 			t.Errorf("String() = %q, want %q", got.String(), "be terse")
 		}
 	})
+
+	// --system must win over --skill-touched: an explicit base replacement is
+	// the stronger statement, and composing a skills menu into a prompt the
+	// caller fully replaced would be a surprise.
+	t.Run("--system wins over --skill-touched", func(t *testing.T) {
+		resetGlobalFlags(t)
+		flagSystem = "be terse"
+		flagSkillTouched = []string{"internal/tui/tui.go"}
+		got := buildDeferredInstructionParts()
+		if got.String() != "be terse" {
+			t.Errorf("String() = %q, want %q", got.String(), "be terse")
+		}
+	})
+
+	t.Run("--skill-touched still yields a prompt", func(t *testing.T) {
+		resetGlobalFlags(t)
+		flagSkillTouched = []string{"internal/tui/tui.go"}
+		got := buildDeferredInstructionParts()
+		if got.Base == "" {
+			t.Error("Base is empty; --skill-touched must not replace the built-in instruction")
+		}
+	})
 }
 
 func TestBuildDeferredCallbacks(t *testing.T) {
@@ -939,7 +971,7 @@ func TestBuildDeferredCallbacks(t *testing.T) {
 	mgr := lsp.NewManager(nil)
 	t.Cleanup(mgr.Shutdown)
 
-	base := buildDeferredCallbacks(config.Config{}, "anthropic", sandbox, nil, nil)
+	base := buildDeferredCallbacks(config.Config{}, "anthropic", sandbox, nil, nil, nil, nil)
 	if base.deduper == nil {
 		t.Error("deduper is nil")
 	}
@@ -954,14 +986,14 @@ func TestBuildDeferredCallbacks(t *testing.T) {
 		t.Errorf("after-tool callbacks = %d, want at least the compactor and deduper", len(base.afterTool))
 	}
 
-	withLSP := buildDeferredCallbacks(config.Config{}, "anthropic", sandbox, mgr, nil)
+	withLSP := buildDeferredCallbacks(config.Config{}, "anthropic", sandbox, mgr, nil, nil, nil)
 	if len(withLSP.afterTool) != len(base.afterTool)+1 {
 		t.Errorf("after-tool callbacks with an LSP manager = %d, want %d",
 			len(withLSP.afterTool), len(base.afterTool)+1)
 	}
 
 	rec := newDeferredMemoryRecorder(config.Config{}, t.TempDir())
-	withMem := buildDeferredCallbacks(config.Config{}, "anthropic", sandbox, nil, rec)
+	withMem := buildDeferredCallbacks(config.Config{}, "anthropic", sandbox, nil, rec, nil, nil)
 	if len(withMem.afterTool) != len(base.afterTool)+1 {
 		t.Errorf("after-tool callbacks with a memory recorder = %d, want %d",
 			len(withMem.afterTool), len(base.afterTool)+1)

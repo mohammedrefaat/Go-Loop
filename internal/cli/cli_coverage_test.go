@@ -297,7 +297,7 @@ func TestCliRunPrintNilLogger(t *testing.T) {
 	ag, sessionID := newTestAgent(t, llm)
 
 	stdout := captureStdout(t, func() {
-		err := runPrint(context.Background(), ag, sessionID, "hi", nil)
+		err := runPrint(context.Background(), ag, sessionID, "hi", nil, nil)
 		if err != nil {
 			t.Fatalf("runPrint error: %v", err)
 		}
@@ -316,7 +316,7 @@ func TestCliRunJSONNilLogger(t *testing.T) {
 	ag, sessionID := newTestAgent(t, llm)
 
 	stdout := captureStdout(t, func() {
-		err := runJSON(context.Background(), ag, sessionID, "hi", nil)
+		err := runJSON(context.Background(), ag, sessionID, "hi", nil, nil)
 		if err != nil {
 			t.Fatalf("runJSON error: %v", err)
 		}
@@ -344,7 +344,7 @@ func TestCliRunPrintWithLogger(t *testing.T) {
 	ag, sessionID := newTestAgent(t, llm)
 
 	stdout := captureStdout(t, func() {
-		err := runPrint(context.Background(), ag, sessionID, "hello", lg)
+		err := runPrint(context.Background(), ag, sessionID, "hello", lg, nil)
 		if err != nil {
 			t.Fatalf("runPrint error: %v", err)
 		}
@@ -378,7 +378,7 @@ func TestCliRunJSONWithLogger(t *testing.T) {
 	ag, sessionID := newTestAgent(t, llm)
 
 	stdout := captureStdout(t, func() {
-		err := runJSON(context.Background(), ag, sessionID, "hello", lg)
+		err := runJSON(context.Background(), ag, sessionID, "hello", lg, nil)
 		if err != nil {
 			t.Fatalf("runJSON error: %v", err)
 		}
@@ -402,7 +402,7 @@ func TestCliRunPrintCancelledContext(t *testing.T) {
 	// With a canceled context, runPrint may return nil (context.Canceled
 	// is suppressed) or an error. Either is acceptable — we just verify no panic.
 	_ = captureStdout(t, func() {
-		_ = runPrint(ctx, ag, sessionID, "hello", nil)
+		_ = runPrint(ctx, ag, sessionID, "hello", nil, nil)
 	})
 }
 
@@ -414,7 +414,7 @@ func TestCliRunJSONCancelledContext(t *testing.T) {
 	cancel()
 
 	_ = captureStdout(t, func() {
-		_ = runJSON(ctx, ag, sessionID, "hello", nil)
+		_ = runJSON(ctx, ag, sessionID, "hello", nil, nil)
 	})
 }
 
