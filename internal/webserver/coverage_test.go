@@ -219,7 +219,8 @@ func TestPtyPool_GetOrCreate_StartError(t *testing.T) {
 func TestWebSocketHandler_CheckOrigin(t *testing.T) {
 	sm := NewSessionManager()
 	defer sm.Close()
-	h := NewWebSocketHandler(sm)
+	pm := NewPairingManager(0)
+	h := NewWebSocketHandler(sm, pm)
 
 	if h.upgrader.CheckOrigin == nil {
 		t.Fatal("expected non-nil CheckOrigin")
