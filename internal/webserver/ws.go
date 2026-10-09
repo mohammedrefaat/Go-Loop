@@ -10,13 +10,15 @@ import (
 // WebSocketHandler handles WebSocket connections for terminal.
 type WebSocketHandler struct {
 	sessionManager *SessionManager
+	pairingManager *PairingManager
 	upgrader       *websocket.Upgrader
 }
 
 // NewWebSocketHandler creates a new WebSocket handler.
-func NewWebSocketHandler(sessionManager *SessionManager) *WebSocketHandler {
+func NewWebSocketHandler(sessionManager *SessionManager, pairingManager *PairingManager) *WebSocketHandler {
 	return &WebSocketHandler{
 		sessionManager: sessionManager,
+		pairingManager: pairingManager,
 		upgrader:       &websocket.Upgrader{CheckOrigin: checkSameOrigin},
 	}
 }
@@ -37,7 +39,13 @@ func (wh *WebSocketHandler) HandleWebSocket(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Create session (validation of token should be done by caller)
+	// Validate token against pairing manager
+	if wh.pairingManager != nil && !wh.pairingManager.IsApproved(token) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Create session
 	session, err := wh.sessionManager.CreateSession("", token)
 	if err != nil {
 		http.Error(w, "Failed to create session", http.StatusInternalServerError)

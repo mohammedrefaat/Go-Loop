@@ -1463,15 +1463,24 @@ func TestServerV2_HandleWebSocket_UpgradeFail(t *testing.T) {
 func TestWebSocketHandler_HandleWebSocket_WithToken(t *testing.T) {
 	sm := NewSessionManager()
 	defer sm.Close()
-	wsh := NewWebSocketHandler(sm)
+	pm := NewPairingManager(5 * time.Minute)
+	code, token, err := pm.CreatePair(".")
+	if err != nil {
+		t.Fatalf("failed to create pair: %v", err)
+	}
+	if _, err := pm.Approve(code); err != nil {
+		t.Fatalf("failed to approve pair: %v", err)
+	}
+
+	wsh := NewWebSocketHandler(sm, pm)
 
 	// With token but no actual WS upgrade — reaches upgrade which fails
-	r := httptest.NewRequest("GET", "/ws/session-1?token=test-token", nil)
+	r := httptest.NewRequest("GET", "/ws/session-1?token="+token, nil)
 	w := httptest.NewRecorder()
 	wsh.HandleWebSocket(w, r)
 
 	// Upgrade fails but auth passed — that's what we're testing
 	if w.Code == http.StatusUnauthorized {
-		t.Error("with token should pass auth check")
+		t.Error("with approved token should pass auth check")
 	}
 }

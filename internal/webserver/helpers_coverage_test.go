@@ -141,7 +141,8 @@ func TestResponseCaptureHijackUnsupported(t *testing.T) {
 func TestWebSocketHandlerEarlyReturns(t *testing.T) {
 	sm := NewSessionManager()
 	defer sm.Close()
-	wh := NewWebSocketHandler(sm)
+	pm := NewPairingManager(0)
+	wh := NewWebSocketHandler(sm, pm)
 
 	tests := []struct {
 		name string
